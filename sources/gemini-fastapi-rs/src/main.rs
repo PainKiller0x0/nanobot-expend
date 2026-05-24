@@ -26,8 +26,8 @@ use gemini::{
 use history::{HistoryRecord, HistoryStore, started, timestamp};
 use images::{ImageData, ImageGenerationRequest, ImageGenerationResponse};
 use openai::{
-    AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, ModelData,
-    ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
+    AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
+    ModelData, ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
     chat_extra_instructions, estimate_tokens, messages_to_gemini_input, process_output,
     response_extra_instructions, response_input_to_gemini_input,
 };
@@ -611,8 +611,8 @@ fn image_token(filename: &str, api_key: Option<&str>) -> Option<String> {
     Some(digest[..24].to_string())
 }
 
-fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
-    if !state.config.image_generation.is_enabled() {
+fn should_use_image_tool(image_generation_enabled: bool, model: &str, prompt: &str) -> bool {
+    if !image_generation_enabled {
         return false;
     }
     let model = model.to_ascii_lowercase();
@@ -651,6 +651,42 @@ fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
         || (prompt.contains('画') && (prompt.contains('图') || prompt.contains("图片")))
 }
 
+fn latest_user_message_text(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| message_content_text(message.content.as_ref()))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn message_content_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") | Some("input_text") | Some("output_text") => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            Some(parts.join("\n"))
+        }
+        other => Some(other.to_string()),
+    }
+}
+
 fn trace_id_from_headers(headers: &HeaderMap) -> String {
     headers
         .get("x-obp-request-id")
@@ -684,19 +720,26 @@ async fn chat_completions(
     let created = Utc::now().timestamp();
     let start = started();
     let trace_id = trace_id_from_headers(&headers);
-    let image_tool = should_use_image_tool(&state, &model_name, &prompt);
+    let image_prompt =
+        latest_user_message_text(&request.messages).unwrap_or_else(|| prompt.clone());
+    let image_tool = should_use_image_tool(
+        state.config.image_generation.is_enabled(),
+        &model_name,
+        &image_prompt,
+    );
     tracing::info!(
         trace_id = %trace_id,
         model = %model_name,
         stream = request.stream.unwrap_or(false),
         prompt_chars = prompt.chars().count(),
+        image_prompt_chars = image_prompt.chars().count(),
         image_tool = image_tool,
         "Gemini FastAPI chat request accepted"
     );
     if image_tool && request.stream.unwrap_or(false) {
         let state_for_stream = state.clone();
         let headers_for_stream = headers.clone();
-        let prompt_for_stream = prompt.clone();
+        let prompt_for_stream = image_prompt.clone();
         let model_for_stream = model_name.clone();
         let web_model = state.config.image_generation.web_model.clone();
         let id = completion_id.clone();
@@ -1036,7 +1079,7 @@ async fn chat_completions(
     let generated = if image_tool {
         state
             .gemini
-            .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
+            .generate_web_image_output(&state.config.image_generation.web_model, &image_prompt)
             .await
     } else {
         state
@@ -1056,7 +1099,11 @@ async fn chat_completions(
                     "chat.completions"
                 },
                 model: &model_name,
-                prompt_chars: prompt.chars().count(),
+                prompt_chars: if image_tool {
+                    image_prompt.chars().count()
+                } else {
+                    prompt.chars().count()
+                },
                 output_chars: output_text.chars().count(),
                 latency_ms: start.elapsed().as_millis(),
                 ok: true,
@@ -1074,7 +1121,11 @@ async fn chat_completions(
                     "chat.completions"
                 },
                 model: &model_name,
-                prompt_chars: prompt.chars().count(),
+                prompt_chars: if image_tool {
+                    image_prompt.chars().count()
+                } else {
+                    prompt.chars().count()
+                },
                 output_chars: 0,
                 latency_ms: start.elapsed().as_millis(),
                 ok: false,
@@ -1224,11 +1275,16 @@ async fn create_response(
     let response_id = format!("resp_{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
-    let image_tool = should_use_image_tool(&state, &request.model, &prompt);
+    let image_prompt = prompt.clone();
+    let image_tool = should_use_image_tool(
+        state.config.image_generation.is_enabled(),
+        &request.model,
+        &image_prompt,
+    );
     let generated = if image_tool {
         state
             .gemini
-            .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
+            .generate_web_image_output(&state.config.image_generation.web_model, &image_prompt)
             .await
     } else {
         state
@@ -1444,5 +1500,73 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "detail": self.detail }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chat_message(role: &str, content: Value) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: Some(content),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn image_intent_ignores_earlier_draw_request_when_latest_user_is_chat() {
+        let messages = vec![
+            chat_message("user", json!("帮我画一张潜龙勿用的图")),
+            chat_message("assistant", json!("现在暂时画不了。")),
+            chat_message(
+                "user",
+                json!("天气好热啊，但是亚运城这边的厅里没有空调，有点烦躁。"),
+            ),
+        ];
+        let full_prompt = messages_to_gemini_input(&messages).prompt;
+        assert!(should_use_image_tool(
+            true,
+            "gemini-3.5-flash",
+            &full_prompt
+        ));
+
+        let latest = latest_user_message_text(&messages).unwrap();
+        assert_eq!(
+            latest,
+            "天气好热啊，但是亚运城这边的厅里没有空调，有点烦躁。"
+        );
+        assert!(!should_use_image_tool(true, "gemini-3.5-flash", &latest));
+    }
+
+    #[test]
+    fn image_intent_uses_latest_user_draw_request() {
+        let messages = vec![
+            chat_message("user", json!("天气好热啊。")),
+            chat_message("assistant", json!("确实很闷。")),
+            chat_message("user", json!("帮我画一张潜龙勿用的图")),
+        ];
+        let latest = latest_user_message_text(&messages).unwrap();
+        assert!(should_use_image_tool(true, "gemini-3.5-flash", &latest));
+    }
+
+    #[test]
+    fn latest_user_text_reads_array_content() {
+        let messages = vec![chat_message(
+            "user",
+            json!([
+                {"type": "text", "text": "天气好热"},
+                {"type": "input_text", "text": "想吐槽一下"}
+            ]),
+        )];
+        assert_eq!(
+            latest_user_message_text(&messages).unwrap(),
+            "天气好热\n想吐槽一下"
+        );
     }
 }
