@@ -639,6 +639,10 @@ fn should_use_image_tool(image_generation_enabled: bool, model: &str, prompt: &s
         "画一张",
         "画张",
         "画个",
+        "画幅",
+        "画一个",
+        "画一下",
+        "给我画",
         "生成图片",
         "生成一张图",
         "生成图",
@@ -648,7 +652,6 @@ fn should_use_image_tool(image_generation_enabled: bool, model: &str, prompt: &s
         "绘制",
     ];
     chinese_intent.iter().any(|needle| prompt.contains(needle))
-        || (prompt.contains('画') && (prompt.contains('图') || prompt.contains("图片")))
 }
 
 fn latest_user_message_text(messages: &[ChatMessage]) -> Option<String> {
@@ -1553,6 +1556,20 @@ mod tests {
         ];
         let latest = latest_user_message_text(&messages).unwrap();
         assert!(should_use_image_tool(true, "gemini-3.5-flash", &latest));
+    }
+
+    #[test]
+    fn image_intent_does_not_trigger_on_discussing_drawing_pain() {
+        assert!(!should_use_image_tool(
+            true,
+            "gemini-3.5-flash",
+            "不，主要是画图很痛苦。。。"
+        ));
+        assert!(!should_use_image_tool(
+            true,
+            "gemini-3.5-flash",
+            "我不会画图，UI/UE 写起来很难受"
+        ));
     }
 
     #[test]
