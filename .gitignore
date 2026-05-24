@@ -1,0 +1,26 @@
+# Build outputs
+**/target/
+**/.venv/
+**/.ruff_cache/
+**/.pytest_cache/
+**/__pycache__/
+**/*.pyc
+
+# Runtime data / secrets
+.env
+*.env
+**/.env
+**/data/config.json
+**/data/router.json
+**/data/stats.json
+**/runtime/
+**/backups/
+**/*.db
+**/*.sqlite
+**/*.log
+**/*.bak
+**/*.bak.*
+
+# Local noise
+.DS_Store
+Thumbs.db
