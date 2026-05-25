@@ -34,6 +34,7 @@ sources/     各个 sidecar / skill / 脚本源码
 
 - `sources/obp-rs`：OBP 智能模型网关，负责模型路由、来源统计、成本账本、降级/兜底。
 - `sources/gemini-fastapi-rs`：Gemini Web FastAPI 的 Rust 实现，面向 OpenAI 兼容调用。
+- `sources/auth-gate-rs`：域名入口表单登录网关，替代浏览器 Basic Auth 弹窗，并让多个 nanobot 域名共享一次登录会话。
 - `sources/wechat-rss-rs`：文章/RSS sidecar，包含微信文章、鸭哥 AI 要闻、付费文章清洗器、QQ 推送格式化。
 - `sources/lof-sidecar-rs`：LOF 投资看板和估值刷新 sidecar。
 - `sources/notify-sidecar-rs`：定时任务桥，把原来 nanobot cron 里适合外置的任务迁出来。

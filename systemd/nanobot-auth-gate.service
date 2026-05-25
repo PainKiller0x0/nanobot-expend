@@ -1,0 +1,18 @@
+[Unit]
+Description=Nanobot form login gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AUTH_GATE_BIND=127.0.0.1:8787
+Environment=AUTH_GATE_USERNAME=nanobot
+Environment=AUTH_GATE_PASSWORD_FILE=/root/.nanobot/caddy_basic_auth.txt
+Environment=AUTH_GATE_SESSION_FILE=/root/.nanobot/auth-gate/sessions.tsv
+Environment=AUTH_GATE_COOKIE_DOMAIN=.painkiller.top
+ExecStart=/usr/local/bin/nanobot-auth-gate
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

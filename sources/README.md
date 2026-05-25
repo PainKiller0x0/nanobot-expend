@@ -3,6 +3,7 @@
 Runtime source snapshots for Rust sidecars on the live server.
 
 Included:
+- auth-gate-rs/: form-login gateway for nanobot domain reverse proxies
 - hermes-check/: HERMES health-check script snapshot
 - qdii-monitor/: LOF notify wrapper scripts
 - _shared/: shared Python helpers for ops skill clients
