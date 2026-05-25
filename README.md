@@ -8,6 +8,18 @@
 - `nanobot-expend`：放我们自己的外挂能力，比如 OBP、RSS、LOF、Notify、Gemini FastAPI Rust、QQ sidecar、知识收件箱等。
 - 敏感配置不进 Git：真实 cookie、token、API key、Basic Auth、运行数据库和统计文件都只留在线上机器。
 
+## 仓库收口策略
+
+`nanobot-expend` 是拓展能力的主仓库。后续我们自己写的 sidecar、skill、脚本、Rust 化服务优先放到这里统一管理。
+
+已经存在的独立仓库（例如 `nanobot-obp`、`Gemini-FastAPI` fork）可以先作为历史镜像或临时调试仓库保留；确认 `nanobot-expend` 里的版本能部署、能回滚、能通过 CI 后，再考虑归档或删除，避免同时维护太多仓库。
+
+原则是：
+
+- 上游 nanobot 的东西留在 `nanobot-exp`，尽量贴近官方。
+- 我们自己的轮子留在 `nanobot-expend`，尽量模块化、Rust 优先、可独立部署。
+- 线上真实配置和运行态数据只留服务器，不进 Git。
+
 ## 目录结构
 
 ```text

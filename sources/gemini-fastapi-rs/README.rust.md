@@ -1,4 +1,4 @@
-# Gemini-FastAPI Rust branch
+﻿# Gemini-FastAPI Rust branch
 
 This branch is the Rust rewrite track for Gemini-FastAPI. The goal is to remove the always-on Python/FastAPI runtime and keep the OpenAI-compatible Gemini Web gateway small enough for sidecar-style deployment.
 
