@@ -582,6 +582,7 @@ pub(crate) async fn index() -> Html<String> {
   <div class="top">
     <h2>LOF Sidecar · Rust</h2>
     <div>
+      <a class="btnlink btn2" href="/">回到驾驶舱</a>
       <a class="btnlink btn2" href="/sidecars">Sidecar &#x603b;&#x63a7;&#x53f0;</a>
       <button class="btn2" onclick="toggleTheme()">切换明暗</button>
       <button onclick="runNow()">立即运行(收盘)</button>
