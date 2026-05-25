@@ -10,7 +10,14 @@
     "gemini-flash",
     "gemini-pro",
     "gemini-3.5-flash",
-    "gemini-3.1-pro"
+    "gemini-3.1-pro",
+    "gemini-3-flash",
+    "gemini-3-pro",
+    "gemini-3.1-flash-lite",
+    "gemini-web-thinking",
+    "gemini-light",
+    "gemini-lite",
+    "gemini-thinking"
   ],
   "default_model": "deepseek-v4-flash",
   "pro_model": "deepseek-v4-pro",
@@ -23,12 +30,14 @@
   "default_alias_models": [
     "deepseek-v4-flash",
     "gpt-4o-mini",
-    "gpt-3.5-turbo"
+    "gpt-3.5-turbo",
+    "gemini-flash"
   ],
   "pro_alias_models": [
     "deepseek-v4-pro",
     "deepseek-reasoner",
-    "gpt-4o"
+    "gpt-4o",
+    "gemini-pro"
   ],
   "route_profiles": {
     "default": {
@@ -42,10 +51,10 @@
       "backup_group": "minimax"
     },
     "gemini": {
-      "default_model": "gemini-flash",
-      "pro_model": "gemini-pro",
-      "emergency_model": "gemini-flash",
-      "backup_model": "gemini-flash",
+      "default_model": "gemini-3.5-flash",
+      "pro_model": "gemini-3.1-pro",
+      "emergency_model": "gemini-3.1-flash-lite",
+      "backup_model": "gemini-3.1-flash-lite",
       "default_group": "gemini",
       "pro_group": "gemini",
       "emergency_group": "gemini",
@@ -56,6 +65,120 @@
     "default-nanobot": "gemini",
     "guangzhou-nanobot": "default"
   },
+  "route_rules": [
+    {
+      "name": "free-health-and-memory",
+      "enabled": true,
+      "priority": 10,
+      "role": "emergency",
+      "model": "LongCat-Flash-Chat",
+      "group": "longcat",
+      "reason": "free task pattern matched",
+      "requested_models": [],
+      "source_patterns": [],
+      "hint_patterns": [
+        "heartbeat",
+        "healthcheck",
+        "self_check",
+        "self-check"
+      ],
+      "latest_text_patterns": [
+        "heartbeat.md",
+        "heartbeat agent",
+        "heartbeat tool",
+        "\"name\":\"heartbeat\"",
+        "\"name\": \"heartbeat\""
+      ],
+      "task_text_patterns": [
+        "extract key facts from this conversation",
+        "only output items matching these categories",
+        "output as concise bullet points"
+      ],
+      "any_text_patterns": [],
+      "min_monthly_cost_rmb": 0.0
+    },
+    {
+      "name": "complex-work-to-pro",
+      "enabled": true,
+      "priority": 80,
+      "role": "pro",
+      "model": "",
+      "group": "",
+      "reason": "complex task pattern matched",
+      "requested_models": [],
+      "source_patterns": [],
+      "hint_patterns": [
+        "compact",
+        "compression",
+        "summarize",
+        "summary",
+        "memory",
+        "reflection",
+        "review",
+        "code_review",
+        "architecture",
+        "migration",
+        "reasoning",
+        "analysis",
+        "diagnose",
+        "root_cause"
+      ],
+      "latest_text_patterns": [],
+      "task_text_patterns": [],
+      "any_text_patterns": [
+        "context compression",
+        "memory consolidation",
+        "code review",
+        "review existing",
+        "root cause",
+        "上下文压缩",
+        "压缩上下文",
+        "代码审查",
+        "根因",
+        "排障"
+      ],
+      "min_monthly_cost_rmb": 0.0
+    },
+    {
+      "name": "gemini-light-explicit",
+      "enabled": true,
+      "priority": 30,
+      "role": "default",
+      "model": "gemini-3.1-flash-lite",
+      "group": "gemini",
+      "reason": "explicit light Gemini model requested",
+      "requested_models": [
+        "gemini-3.1-flash-lite",
+        "gemini-light",
+        "gemini-lite"
+      ],
+      "source_patterns": [],
+      "hint_patterns": [],
+      "latest_text_patterns": [],
+      "task_text_patterns": [],
+      "any_text_patterns": [],
+      "min_monthly_cost_rmb": 0.0
+    },
+    {
+      "name": "gemini-thinking-explicit",
+      "enabled": true,
+      "priority": 31,
+      "role": "pro",
+      "model": "gemini-web-thinking",
+      "group": "gemini",
+      "reason": "explicit thinking Gemini model requested",
+      "requested_models": [
+        "gemini-web-thinking",
+        "gemini-thinking"
+      ],
+      "source_patterns": [],
+      "hint_patterns": [],
+      "latest_text_patterns": [],
+      "task_text_patterns": [],
+      "any_text_patterns": [],
+      "min_monthly_cost_rmb": 0.0
+    }
+  ],
   "pro_prompt_chars": 0,
   "pro_message_count": 0,
   "monthly_warn_rmb": 10.0,

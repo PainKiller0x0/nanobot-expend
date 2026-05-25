@@ -2356,9 +2356,9 @@ mod tests {
     #[test]
     fn gemini_preset_routes_legacy_default_request_to_gemini_default() {
         let mut router = RouterConfig::default();
-        router.default_model = "gemini-flash".to_string();
+        router.default_model = "gemini-3.5-flash".to_string();
         router.default_group = "gemini".to_string();
-        router.pro_model = "gemini-pro".to_string();
+        router.pro_model = "gemini-3.1-pro".to_string();
         router.pro_group = "gemini".to_string();
         let body = serde_json::json!({
             "model": "deepseek-v4-flash",
@@ -2375,7 +2375,7 @@ mod tests {
 
         assert_eq!(decision.role, "default");
         assert_eq!(decision.group, "gemini");
-        assert_eq!(decision.desired_model, "gemini-flash");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash");
     }
 
     #[test]
@@ -2453,7 +2453,7 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.desired_model, "gemini-flash");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash");
         assert_eq!(decision.group, "gemini");
     }
 
@@ -2481,7 +2481,7 @@ mod tests {
     #[tokio::test]
     async fn gemini_target_channel_beats_requested_model_compat_channel() {
         let mut router = RouterConfig::default();
-        router.default_model = "gemini-flash".to_string();
+        router.default_model = "gemini-3.5-flash".to_string();
         router.default_group = "gemini".to_string();
         let decision = RouteDecision {
             requested_model: "deepseek-v4-flash".to_string(),
@@ -2530,9 +2530,9 @@ mod tests {
     #[test]
     fn gemini_preset_routes_legacy_pro_request_to_gemini_pro() {
         let mut router = RouterConfig::default();
-        router.default_model = "gemini-flash".to_string();
+        router.default_model = "gemini-3.5-flash".to_string();
         router.default_group = "gemini".to_string();
-        router.pro_model = "gemini-pro".to_string();
+        router.pro_model = "gemini-3.1-pro".to_string();
         router.pro_group = "gemini".to_string();
         let body = serde_json::json!({
             "model": "deepseek-v4-pro",
@@ -2549,7 +2549,7 @@ mod tests {
 
         assert_eq!(decision.role, "pro");
         assert_eq!(decision.group, "gemini");
-        assert_eq!(decision.desired_model, "gemini-pro");
+        assert_eq!(decision.desired_model, "gemini-3.1-pro");
     }
 
     #[test]
