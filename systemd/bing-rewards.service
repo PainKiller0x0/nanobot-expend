@@ -10,7 +10,7 @@ Environment=CHROMIUM_PATH=/usr/bin/chromium
 Environment=PYTHONUNBUFFERED=1
 Environment=BING_ACCOUNTS_FILE=/root/nanobot-expend/sources/bing-rewards/accounts.json
 ExecStart=/usr/bin/python3 bing_rewards.py
-ExecStopPost=/bin/sh -c "pkill -9 -f chromium 2>/dev/null; true"
+ExecStopPost=/bin/sh -c "pkill -TERM -f '[c]hromium' 2>/dev/null; sleep 2; pkill -KILL -f '[c]hromium' 2>/dev/null; true"
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=bing-rewards

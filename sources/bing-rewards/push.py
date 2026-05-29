@@ -13,6 +13,13 @@ import logging
 import os
 import random
 import time
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"urllib3 .*doesn\x27t match a supported version.*",
+    category=Warning,
+)
 
 import requests
 
