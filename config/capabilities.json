@@ -497,5 +497,47 @@
     ],
     "mcp_tools": [],
     "notes": "先作为受控 skill 接入，不启用常驻 MCP。需要 Node/npm/Chromium/bb-browser，缺失时运行 setup_bb_browser.sh。"
+  },
+  {
+    "id": "bing-rewards-auto",
+    "name": "Bing Rewards 自动化",
+    "description": "每日 Bing Rewards 微软积分自动搜索+活动完成。多账号支持，oneshot 按需运行不占常驻资源。",
+    "category": "自动化",
+    "kind": "cron",
+    "service_id": "bing-rewards",
+    "entry_url": null,
+    "enabled": true,
+    "trigger_phrases": [
+      "Bing Rewards 怎么样",
+      "积分拿到了吗",
+      "Rewards 跑了吗",
+      "Bing 积分状态"
+    ],
+    "commands": [
+      {
+        "label": "查看日志",
+        "command": "journalctl -u bing-rewards.service -n 60 --no-pager"
+      },
+      {
+        "label": "手动执行",
+        "command": "systemctl start bing-rewards.service"
+      },
+      {
+        "label": "Timer 状态",
+        "command": "systemctl status bing-rewards.timer --no-pager"
+      }
+    ],
+    "data_paths": [
+      "/root/nanobot-expend/sources/bing-rewards"
+    ],
+    "tags": [
+      "bing",
+      "rewards",
+      "automation",
+      "cron",
+      "oneshot"
+    ],
+    "mcp_tools": [],
+    "notes": "基于 Playwright + Chromium，每天 00:05 CST 执行，Persistent=true 错过可补跑。"
   }
 ]

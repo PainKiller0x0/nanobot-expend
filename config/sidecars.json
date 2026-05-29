@@ -115,5 +115,18 @@
     "public": false,
     "logs_command": "journalctl -u podman-port-forward-allow.service -n 80 --no-pager",
     "restart_command": "systemctl restart podman-port-forward-allow.service"
+  },
+  {
+    "id": "bing-rewards",
+    "name": "Bing Rewards 自动化",
+    "description": "每日 Bing Rewards 搜索+活动自动化，每天凌晨 00:05 执行，oneshot 模式不占常驻资源。",
+    "port": null,
+    "unit": "bing-rewards.timer",
+    "homepage_url": null,
+    "check_url": null,
+    "check_kind": "unit",
+    "public": false,
+    "logs_command": "journalctl -u bing-rewards.service -n 60 --no-pager",
+    "restart_command": "systemctl start bing-rewards.service"
   }
 ]

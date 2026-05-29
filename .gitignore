@@ -24,3 +24,6 @@
 # Local noise
 .DS_Store
 Thumbs.db
+**/accounts.json
+**/cookies.json
+**/session.json

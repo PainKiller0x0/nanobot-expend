@@ -1,0 +1,20 @@
+[Unit]
+Description=Bing Rewards 每日任务自动化
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/nanobot-expend/sources/bing-rewards
+Environment=CHROMIUM_PATH=/usr/bin/chromium
+Environment=PYTHONUNBUFFERED=1
+Environment=BING_ACCOUNTS_FILE=/root/nanobot-expend/sources/bing-rewards/accounts.json
+ExecStart=/usr/bin/python3 bing_rewards.py
+ExecStopPost=/bin/sh -c "pkill -9 -f chromium 2>/dev/null; true"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bing-rewards
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

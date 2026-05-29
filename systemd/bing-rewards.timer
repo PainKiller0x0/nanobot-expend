@@ -1,0 +1,11 @@
+[Unit]
+Description=Bing Rewards 每日凌晨 00:05 执行
+Requires=bing-rewards.service
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
