@@ -10,6 +10,7 @@
   {"name": "主号", "session": {...}, "appkey": ""}
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -81,6 +82,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+# Windows GBK 终端下切换 stdout 到 UTF-8，避免 emoji/中文编码报错
+if sys.platform == "win32":
+    sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1)
+# Windows GBK 终端下替换 emoji 避免编码报错
+if sys.platform == "win32":
+    for handler in logging.root.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setStream(open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1))
 log = logging.getLogger("bing_rewards")
 
 
@@ -198,8 +207,8 @@ async def handle_quiz_page(page):
 
 
 async def click_daily_activities(page):
-    """点击 Rewards 页面的每日活动链接。"""
-    log.info("打开 Rewards 面板...")
+    """点击 Rewards 每日活动中的点击搜索项（每个 10 分），返回成功数。"""
+    log.info("进入 Rewards 页面，查找每日活动...")
     try:
         await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
     except PlaywrightTimeout:
@@ -207,45 +216,41 @@ async def click_daily_activities(page):
         return 0
     await asyncio.sleep(5)
 
-    clicked = 0
-    xpaths = [
-        '//*[contains(@id, "react-aria")]//a[1]',
-        '//*[contains(@id, "react-aria")]//a[2]',
-        '//*[contains(@id, "react-aria")]//a[3]',
-    ]
-    for i, xpath in enumerate(xpaths):
-        try:
-            elem = page.locator(f"xpath={xpath}").first
-            if await elem.count() == 0:
-                continue
-            href = await elem.get_attribute("href") or ""
-            if "/refer" in href or "/dashboard" in href:
-                continue
-            if not href.startswith("http") and not href.startswith("/"):
-                continue
-            log.info("点击活动 %d: %s", i + 1, href[:80])
-            await elem.click()
-            await asyncio.sleep(3)
+    # 直接用 JS 找所有可见的 bing 搜索链接并点击
+    # Playwright 的 a[href="..."] 定位长 URL 时容易不匹配
+    clicked = await page.evaluate("""
+        async () => {
+            const links = [];
+            const seen = new Set();
+            for (const a of document.querySelectorAll('a[href*="bing.com/search"]')) {
+                const href = a.href;
+                if (href.includes('rewards.bing.com')) continue;
+                if (seen.has(href)) continue;
+                seen.add(href);
+                const r = a.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                links.push(a);
+            }
 
-            pages = page.context.pages
-            if len(pages) > 1:
-                new_page = pages[-1]
-                await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
-                await asyncio.sleep(2)
-                await handle_quiz_page(new_page)
-                await new_page.close()
-                await asyncio.sleep(1)
-                await page.bring_to_front()
+            let done = 0;
+            for (const el of links.slice(0, 3)) {
+                try {
+                    el.click();
+                    await new Promise(r => setTimeout(r, 3000));
+                    done++;
+                } catch(e) {
+                    // ignore
+                }
+            }
+            return done;
+        }
+    """)
 
-            clicked += 1
-            await asyncio.sleep(ACTIVITY_CLICK_DELAY)
-        except Exception as e:
-            log.warning("活动 %d 处理异常: %s", i + 1, str(e)[:80])
-    log.info("每日活动完成: 点击 %d 个", clicked)
+    log.info("每日活动完成: 成功 %d/3", clicked)
     return clicked
 
 
-async def run_one_account(account: dict, index: int, total: int):
+async def run_one_account(account: dict, index: int, total: int, local: bool = False):
     """对单个账号执行完整的 Rewards 流程。
 
     返回值: "success" | "expired" | "error"
@@ -270,15 +275,34 @@ async def run_one_account(account: dict, index: int, total: int):
 
     async with async_playwright() as p:
         use_xvfb = os.getenv("USE_HEADED", "").lower() == "true"
-        launch_kw = {
-            "headless": not use_xvfb,
-            "args": XVFB_ARGS if use_xvfb else HEADLESS_ARGS,
-        }
-        chromium_path = os.getenv("CHROMIUM_PATH", "")
-        if chromium_path:
-            launch_kw["executable_path"] = chromium_path
+
+        if local:
+            # 本地测试：用系统 Chrome（headed），不要 Playwright 自带的 Chromium
+            channel = None
+            chrome_paths = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ]
+            for cp in chrome_paths:
+                if os.path.exists(cp):
+                    channel = "chrome"
+                    break
+            launch_kw = {
+                "headless": False,
+                "channel": channel,
+                "args": HEADLESS_ARGS,
+            }
+            log.info("浏览器模式: 本地 headed (%s)", channel or "chromium")
+        else:
+            launch_kw = {
+                "headless": not use_xvfb,
+                "args": XVFB_ARGS if use_xvfb else HEADLESS_ARGS,
+            }
+            chromium_path = os.getenv("CHROMIUM_PATH", "")
+            if chromium_path:
+                launch_kw["executable_path"] = chromium_path
+            log.info("浏览器模式: %s", "headed (Xvfb)" if use_xvfb else "headless")
         browser = await p.chromium.launch(**launch_kw)
-        log.info("浏览器模式: %s", "headed (Xvfb)" if use_xvfb else "headless")
         try:
             ctx_kwargs = {**DEFAULT_CONTEXT_OPTIONS, "viewport": {"width": 1920, "height": 1080}}
             if use_session:
@@ -334,8 +358,9 @@ async def run_one_account(account: dict, index: int, total: int):
                 log.info("积分已满，可能尚未跨天，%d 分钟后重试...", CHECK_INTERVAL // 60)
                 await asyncio.sleep(CHECK_INTERVAL)
 
-            await perform_searches(page, search_words)
+            # 先点每日活动（3 个点击搜索项，各 10 分），再做 30 轮常规搜索
             await click_daily_activities(page)
+            await perform_searches(page, search_words)
         finally:
             await browser.close()
 
@@ -343,11 +368,26 @@ async def run_one_account(account: dict, index: int, total: int):
     return "success"
 
 
-async def main():
-    accounts = load_accounts()
-    if not accounts:
-        push_send("Bing Rewards 配置错误", "BING_ACCOUNTS 为空或解析失败", is_success=False)
-        return 1
+async def main(local: bool = False, local_file: str = ""):
+    if local:
+        file_path = local_file or os.path.join(os.path.expanduser("~"), "Desktop", "bing_rewards_小号.txt")
+        log.info("本地测试模式，读取账号文件: %s", file_path)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except Exception as e:
+            log.error("读取文件失败: %s", e)
+            return 1
+        # 兼容 {}/[] 两种格式
+        if raw.startswith("{"):
+            raw = f"[{raw}]"
+        accounts = json.loads(raw)
+        log.info("加载了 %d 个账号（本地文件）", len(accounts))
+    else:
+        accounts = load_accounts()
+        if not accounts:
+            push_send("Bing Rewards 配置错误", "BING_ACCOUNTS 为空或解析失败", is_success=False)
+            return 1
 
     total = len(accounts)
     results = {"success": [], "expired": [], "error": []}
@@ -355,7 +395,7 @@ async def main():
     for i, account in enumerate(accounts):
         name = account.get("name", f"账号{i + 1}")
         try:
-            status = await run_one_account(account, i, total)
+            status = await run_one_account(account, i, total, local=local)
             results[status].append(name)
         except Exception as e:
             log.exception("账号 %s 异常: %s", name, e)
@@ -372,29 +412,35 @@ async def main():
     log.info("=" * 50)
     log.info("完成: 成功 %d, 过期 %d, 失败 %d, 总计 %d", success_n, expired_n, error_n, total)
 
-    # ── 推送通知 ──
+    # ── 推送通知（本地测试跳过） ──
     now_str = datetime.now().strftime("%m-%d %H:%M")
-    lines = [f"Bing Rewards 执行完毕 ({now_str})", ""]
-    if results["success"]:
-        lines.append(f"✅ 成功 ({success_n}): {', '.join(results['success'])}")
-    if results["expired"]:
-        lines.append(f"⚠️ 会话过期 ({expired_n}): {', '.join(results['expired'])}")
-        lines.append("")
-        lines.append("更新方法: F12 → Network → 重新复制 Cookie 并更新 BING_ACCOUNTS；")
-        lines.append("或运行 login_helper.py 重新生成 session。更新后手动重跑 Action。")
-    if results["error"]:
-        lines.append(f"❌ 执行失败 ({error_n}): {', '.join(results['error'])}")
+    if not local:
+        lines = [f"Bing Rewards 执行完毕 ({now_str})", ""]
+        if results["success"]:
+            lines.append(f"✅ 成功 ({success_n}): {', '.join(results['success'])}")
+        if results["expired"]:
+            lines.append(f"⚠️ 会话过期 ({expired_n}): {', '.join(results['expired'])}")
+            lines.append("")
+            lines.append("更新方法: F12 → Network → 重新复制 Cookie 并更新 BING_ACCOUNTS；")
+            lines.append("或运行 login_helper.py 重新生成 session。更新后手动重跑 Action。")
+        if results["error"]:
+            lines.append(f"❌ 执行失败 ({error_n}): {', '.join(results['error'])}")
 
-    content = "\n".join(lines)
-    title = f"Bing Rewards {'✅' if expired_n == 0 and error_n == 0 else '⚠️'} {success_n}/{total} ({now_str})"
-    push_send(title, content, is_success=(expired_n == 0 and error_n == 0))
+        content = "\n".join(lines)
+        title = f"Bing Rewards {'✅' if expired_n == 0 and error_n == 0 else '⚠️'} {success_n}/{total} ({now_str})"
+        push_send(title, content, is_success=(expired_n == 0 and error_n == 0))
     return 0 if (expired_n == 0 and error_n == 0) else 1
 
 
 if __name__ == "__main__":
-    log.info("Bing Rewards 多账号自动化启动")
+    parser = argparse.ArgumentParser(description="Bing Rewards 每日任务自动化")
+    parser.add_argument("--local", action="store_true", help="本地测试模式，读取桌面 bing_rewards_小号.txt")
+    parser.add_argument("--file", default="", help="自定义账号文件路径")
+    args = parser.parse_args()
+
+    log.info("Bing Rewards 多账号自动化启动 (local=%s)", args.local)
     try:
-        sys.exit(asyncio.run(main()))
+        sys.exit(asyncio.run(main(local=args.local, local_file=args.file)))
     except Exception as e:
         log.exception("致命错误: %s", e)
         sys.exit(1)
