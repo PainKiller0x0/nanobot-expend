@@ -25,7 +25,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 from browser_utils import (
     BING_URL, REWARDS_URL, HEADLESS_ARGS, XVFB_ARGS, DEFAULT_CONTEXT_OPTIONS,
-    ANTI_DETECTION_SCRIPT, check_logged_in, get_rewards_points,
+    ANTI_DETECTION_SCRIPT, USER_AGENT, check_logged_in, get_rewards_points,
 )
 from push import send as push_send
 
@@ -52,6 +52,9 @@ PAGE_TIMEOUT = 30000
 
 # 两个账号之间的冷却时间（秒），避免同 IP 连续操作被风控
 ACCOUNT_COOLDOWN = 300
+
+# 持久化浏览器 profile 目录（服务器上使用 launch_persistent_context）
+PROFILES_DIR = os.path.join(os.path.expanduser("~"), ".bing-rewards-profiles")
 
 # 热门词 API 地址（原脚本来源：api.gmya.net）
 HOT_WORDS_API = "https://api.gmya.net/Api/"
@@ -302,22 +305,57 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
             if chromium_path:
                 launch_kw["executable_path"] = chromium_path
             log.info("浏览器模式: %s", "headed (Xvfb)" if use_xvfb else "headless")
-        browser = await p.chromium.launch(**launch_kw)
+        browser_or_ctx = None
         try:
-            ctx_kwargs = {**DEFAULT_CONTEXT_OPTIONS, "viewport": {"width": 1920, "height": 1080}}
-            if use_session:
-                ctx_kwargs["storage_state"] = session
-
-            context = await browser.new_context(**ctx_kwargs)
-            await context.add_init_script(ANTI_DETECTION_SCRIPT)
-            page = await context.new_page()
-
-            if not use_session:
-                cookies = parse_cookies(raw_cookies)
-                await context.add_cookies(cookies)
-                log.info("已注入 %d 条 cookie", len(cookies))
+            if local:
+                # 本地测试：用 session 快照 + system Chrome headed
+                browser = await p.chromium.launch(**launch_kw)
+                ctx_kwargs = {**DEFAULT_CONTEXT_OPTIONS, "viewport": {"width": 1920, "height": 1080}}
+                if use_session:
+                    ctx_kwargs["storage_state"] = session
+                context = await browser.new_context(**ctx_kwargs)
+                await context.add_init_script(ANTI_DETECTION_SCRIPT)
+                page = await context.new_page()
+                if not use_session:
+                    cookies = parse_cookies(raw_cookies)
+                    await context.add_cookies(cookies)
+                    log.info("已注入 %d 条 cookie", len(cookies))
+                else:
+                    log.info("已恢复完整浏览器会话")
+                browser_or_ctx = browser
             else:
-                log.info("已恢复完整浏览器会话")
+                # 服务器：用持久化 profile（Chrome 自动维护 token 续期）
+                profile_dir = os.path.join(PROFILES_DIR, name)
+                os.makedirs(PROFILES_DIR, exist_ok=True)
+                has_cookies = os.path.exists(os.path.join(profile_dir, "Default", "Cookies"))
+                persistent_kw = {
+                    "user_data_dir": profile_dir,
+                    "headless": not use_xvfb,
+                    "args": XVFB_ARGS if use_xvfb else HEADLESS_ARGS,
+                    "viewport": {"width": 1920, "height": 1080},
+                    "user_agent": USER_AGENT,
+                    "locale": "zh-CN",
+                    "timezone_id": "Asia/Shanghai",
+                }
+                chromium_path = os.getenv("CHROMIUM_PATH", "")
+                if chromium_path:
+                    persistent_kw["executable_path"] = chromium_path
+                context = await p.chromium.launch_persistent_context(**persistent_kw)
+                await context.add_init_script(ANTI_DETECTION_SCRIPT)
+                page = context.pages[0] if context.pages else await context.new_page()
+
+                if has_cookies:
+                    log.info("使用已有持久化 profile")
+                elif session:
+                    log.info("首次使用，从 session 注入 cookie 种子 ...")
+                    await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
+                    await context.add_cookies(session["cookies"])
+                    await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(3)
+                    log.info("Cookie 种子注入完成")
+                else:
+                    log.warning("无 session 也无 profile，可能无法登录")
+                browser_or_ctx = context
 
             await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2)
@@ -366,7 +404,8 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 log.warning("每日活动执行失败（不影响搜索）: %s", e)
             await perform_searches(page, search_words)
         finally:
-            await browser.close()
+            if browser_or_ctx:
+                await browser_or_ctx.close()
 
     log.info("账号 %s 完成", name)
     return "success"

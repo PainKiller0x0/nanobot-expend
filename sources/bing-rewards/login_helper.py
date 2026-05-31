@@ -129,9 +129,13 @@ async def main(name: str, channel: str = None):
     print(f"{'=' * 50}\n")
     print("即将打开浏览器，请手动登录微软账号（支持扫码/密码/验证码）。\n")
 
-    user_data_dir = os.path.join(os.path.expanduser("~"), ".bing_rewards_profile")
+    profiles_root = os.path.join(os.path.expanduser("~"), ".bing-rewards-profiles")
+    user_data_dir = os.path.join(profiles_root, name)
     if os.path.exists(user_data_dir):
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+        print(f"  已有 profile: {user_data_dir}")
+        print("  如需重新登录，请先手动删除该目录。\n")
+    else:
+        print(f"  将创建新的 profile: {user_data_dir}\n")
 
     async with async_playwright() as p:
         persistent_kwargs = {
@@ -196,9 +200,10 @@ async def main(name: str, channel: str = None):
             f.write(output)
 
         await context.close()
-        shutil.rmtree(user_data_dir, ignore_errors=True)
 
         print(f"\n✅ 会话已保存到桌面: {filename}")
+        print(f"✅ 浏览器 profile 已保留: {user_data_dir}")
+        print(f"   将此目录上传到服务器即可持久化登录态。\n")
         print(f"\n── 单账号 ──")
         print(f"   用 [ ] 包住 {filename} 的内容，贴到 BING_ACCOUNTS")
         print(f"   即: [<文件内容>]")
