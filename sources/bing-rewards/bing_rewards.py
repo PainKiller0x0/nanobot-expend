@@ -327,7 +327,10 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 # 服务器：用持久化 profile（Chrome 自动维护 token 续期）
                 profile_dir = os.path.join(PROFILES_DIR, name)
                 os.makedirs(PROFILES_DIR, exist_ok=True)
-                has_cookies = os.path.exists(os.path.join(profile_dir, "Default", "Cookies"))
+                has_cookies = (
+                    os.path.exists(os.path.join(profile_dir, "Default", "Network", "Cookies")) or
+                    os.path.exists(os.path.join(profile_dir, "Default", "Cookies"))
+                )
                 persistent_kw = {
                     "user_data_dir": profile_dir,
                     "headless": not use_xvfb,
@@ -346,15 +349,15 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
 
                 if has_cookies:
                     log.info("使用已有持久化 profile")
-                elif session:
-                    log.info("首次使用，从 session 注入 cookie 种子 ...")
+                else:
+                    log.info("新建 profile（尚无 cookie 文件）")
+                # 始终从 accounts.json 注入 cookie，覆盖 profile 中的旧值
+                if session:
+                    log.info("从 session 注入 cookie ...")
                     await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
                     await context.add_cookies(session["cookies"])
                     await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
                     await asyncio.sleep(3)
-                    log.info("Cookie 种子注入完成")
-                else:
-                    log.warning("无 session 也无 profile，可能无法登录")
                 browser_or_ctx = context
 
             await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
