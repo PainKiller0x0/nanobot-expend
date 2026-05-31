@@ -359,7 +359,11 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 await asyncio.sleep(CHECK_INTERVAL)
 
             # 先点每日活动（3 个点击搜索项，各 10 分），再做 30 轮常规搜索
-            await click_daily_activities(page)
+            # 活动失败不影响搜索，各自独立
+            try:
+                await click_daily_activities(page)
+            except Exception as e:
+                log.warning("每日活动执行失败（不影响搜索）: %s", e)
             await perform_searches(page, search_words)
         finally:
             await browser.close()
