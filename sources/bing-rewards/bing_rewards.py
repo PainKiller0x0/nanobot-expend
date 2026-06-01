@@ -25,7 +25,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 from browser_utils import (
     BING_URL, REWARDS_URL, HEADLESS_ARGS, XVFB_ARGS, DEFAULT_CONTEXT_OPTIONS,
-    ANTI_DETECTION_SCRIPT, USER_AGENT, check_logged_in, get_rewards_points,
+    ANTI_DETECTION_SCRIPT, USER_AGENT,
+    check_logged_in, get_rewards_points,
 )
 from push import send as push_send
 
@@ -188,7 +189,6 @@ async def perform_searches(page, search_words):
     log.info("搜索任务完成")
 
 
-async def handle_quiz_page(page):
     """尝试在 quiz/poll 页面随机点击选项并确认。"""
     try:
         await asyncio.sleep(1)
@@ -409,6 +409,7 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
         finally:
             if browser_or_ctx:
                 await browser_or_ctx.close()
+
 
     log.info("账号 %s 完成", name)
     return "success"
