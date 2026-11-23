@@ -1,7 +1,7 @@
 """Bing Rewards 公共浏览器工具 — bing_rewards.py 和 login_helper.py 共用。"""
 
 # ── 常量 ──────────────────────────────────────────────
-BING_URL = "https://www.bing.com"
+BING_URL = "https://cn.bing.com"
 REWARDS_URL = "https://rewards.bing.com/dashboard"
 
 USER_AGENT = (
@@ -23,6 +23,11 @@ HEADLESS_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--window-size=1920,1080",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--no-crash-upload",
+    "--no-first-run",
 ]
 
 HEADFUL_ARGS = [
@@ -37,6 +42,11 @@ XVFB_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-setuid-sandbox",
     "--window-size=1920,1080",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--no-crash-upload",
+    "--no-first-run",
 ]
 
 DEFAULT_CONTEXT_OPTIONS = {
