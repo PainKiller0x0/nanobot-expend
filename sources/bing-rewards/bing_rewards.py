@@ -162,11 +162,367 @@ async def fetch_hot_words(appkey: str = ""):
     return DEFAULT_SEARCH_WORDS
 
 
-async def perform_searches(page, search_words, context):
+# 积分日的业务时区未验证。检查点同时记下调用方日期和 Asia/Shanghai 日期，
+# 任一日期变化都按可能重置处理，而且检查点本身不能当成完成。
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+CHECKPOINT_FILENAME = "resume-checkpoint.json"
+MAX_PAGE_REOPEN = 1
+PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+_CLOSED_TARGET_MARKER = "target page, context or browser has been closed"
+_RESTRICTION_URL_MARKERS = (
+    "captcha",
+    "/challenge",
+    "account.live.com/abuse",
+    "account.live.com/identity/confirm",
+    "account.live.com/recover",
+    "account.live.com/proofs",
+)
+_RESTRICTION_TEXT_MARKERS = (
+    "verify you are human",
+    "unusual activity",
+    "account has been suspended",
+    "account suspended",
+    "suspended account",
+    "账号已被暂停",
+    "账号已被限制",
+    "账号被封禁",
+)
+
+
+class BrowserClosedError(RuntimeError):
+    def __init__(self, completed=0):
+        super().__init__("browser context closed")
+        self.completed = int(completed)
+
+
+class AccountRestrictedError(RuntimeError):
+    def __init__(self):
+        super().__init__("restricted")
+
+
+def is_target_closed_error(exc) -> bool:
+    return isinstance(exc, PlaywrightError) and _CLOSED_TARGET_MARKER in str(exc).casefold()
+
+
+def context_is_usable(context) -> bool:
+    if context is None:
+        return False
+    try:
+        is_closed = getattr(context, "is_closed", None)
+        if callable(is_closed) and is_closed():
+            return False
+        browser = getattr(context, "browser", None)
+        if callable(browser):
+            browser = browser()
+        if browser is not None:
+            connected = getattr(browser, "is_connected", None)
+            if callable(connected) and not connected():
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def page_is_closed(page) -> bool:
+    try:
+        is_closed = getattr(page, "is_closed", None)
+        return bool(is_closed()) if callable(is_closed) else False
+    except Exception:
+        return True
+
+
+async def restriction_stop_reason(page):
+    """识别验证码、封禁或账号限制。只决定停止，不包含绕过。"""
+    url = str(getattr(page, "url", "") or "").casefold()
+    if any(marker in url for marker in _RESTRICTION_URL_MARKERS):
+        return "url"
+    title_fn = getattr(page, "title", None)
+    title = ""
+    if callable(title_fn):
+        try:
+            title = str(await title_fn() or "")
+        except Exception:
+            title = ""
+    folded = title.casefold()
+    if any(marker.casefold() in folded for marker in _RESTRICTION_TEXT_MARKERS):
+        return "title"
+    return None
+
+
+async def stop_if_restricted(page):
+    if await restriction_stop_reason(page):
+        log.error("检测到验证码或账号限制，立即停止（不绕过、不更换身份或代理）")
+        raise AccountRestrictedError()
+
+
+def rewards_day_keys(now: datetime) -> dict:
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError("rewards day comparison requires an aware timestamp")
+    return {
+        "local_date": now.date().isoformat(),
+        "shanghai_date": now.astimezone(SHANGHAI_TZ).date().isoformat(),
+        "rewards_timezone": "unverified",
+    }
+
+
+def checkpoint_period_relation(record, now: datetime) -> str:
+    if not record:
+        return "absent"
+    keys = record.get("day_keys") if isinstance(record, dict) else None
+    if not isinstance(keys, dict):
+        return "unknown"
+    if keys.get("rewards_timezone") != "unverified":
+        return "unknown"
+    if "local_date" not in keys or "shanghai_date" not in keys:
+        return "unknown"
+    current = rewards_day_keys(now)
+    if (
+        keys.get("local_date") != current["local_date"]
+        or keys.get("shanghai_date") != current["shanghai_date"]
+    ):
+        return "reset"
+    return "same_calendar_dates_timezone_unverified"
+
+
+def _snapshot_ints(snapshot):
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        parsed = {
+            "search_earned": int(snapshot["search_earned"]),
+            "search_max": int(snapshot["search_max"]),
+            "activities_done": int(snapshot["activities_done"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if parsed["search_earned"] < 0 or parsed["activities_done"] < 0 or parsed["search_max"] <= 0:
+        return None
+    return parsed
+
+
+def remaining_search_attempts(snapshot, max_searches=MAX_SEARCHES):
+    """按当前已入账缺口限制搜索次数，不超过配置上限。
+
+    单次搜索对应的分数未验证，所以用距离既有 60 分完成线的缺口作为次数上界。
+    历史尝试次数不是已入账分数。
+    """
+    parsed = _snapshot_ints(snapshot)
+    if not parsed:
+        return None
+    earned = parsed["search_earned"]
+    if earned >= 60 or earned >= parsed["search_max"]:
+        return 0
+    gap = min(parsed["search_max"], 60) - earned
+    if gap <= 0:
+        return 0
+    return min(int(max_searches), gap)
+
+
+def remaining_activities(snapshot):
+    parsed = _snapshot_ints(snapshot)
+    if not parsed:
+        return None
+    return max(0, min(3, 3 - parsed["activities_done"]))
+
+
+def plan_remaining_work(live_snapshot, checkpoint_record, now):
+    relation = checkpoint_period_relation(checkpoint_record, now)
+    parsed = _snapshot_ints(live_snapshot)
+    if parsed and rewards_quotas_complete(parsed):
+        return {
+            "action": "skip",
+            "reason": "live_quotas_complete",
+            "checkpoint_relation": relation,
+            "complete": True,
+            "searches": 0,
+            "activities": 0,
+        }
+    searches = remaining_search_attempts(live_snapshot)
+    activities = remaining_activities(live_snapshot)
+    if searches is None or activities is None:
+        return {
+            "action": "stop",
+            "reason": "live_credit_unknown",
+            "checkpoint_relation": relation,
+            "complete": False,
+            "searches": None,
+            "activities": None,
+        }
+    return {
+        "action": "run",
+        "reason": "live_remaining",
+        "checkpoint_relation": relation,
+        "complete": False,
+        "searches": searches,
+        "activities": activities,
+    }
+
+
+def account_checkpoint_key(name: str) -> str:
+    import hashlib
+    return hashlib.sha256(str(name).encode("utf-8")).hexdigest()
+
+
+def _public_snapshot(snapshot):
+    parsed = _snapshot_ints(snapshot)
+    if not parsed:
+        return None
+    if isinstance(snapshot, dict) and "today_total" in snapshot:
+        try:
+            parsed["today_total"] = int(snapshot["today_total"])
+        except (TypeError, ValueError):
+            pass
+    return parsed
+
+
+def record_checkpoint(account_name, *, now, directory, reason, complete, snapshot, searches_started):
+    public = _public_snapshot(snapshot)
+    entry = {
+        "complete": bool(complete and public and rewards_quotas_complete(public)),
+        "reason": str(reason),
+        "searches_started": max(0, int(searches_started or 0)),
+        "day_keys": rewards_day_keys(now),
+        "snapshot": public,
+    }
+    directory = directory or PROFILES_DIR
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, CHECKPOINT_FILENAME)
+    data = {"version": 1, "accounts": {}}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict) and isinstance(loaded.get("accounts"), dict):
+                data["accounts"] = loaded["accounts"]
+        except (OSError, json.JSONDecodeError):
+            data = {"version": 1, "accounts": {}}
+    data["accounts"][account_checkpoint_key(account_name)] = entry
+    text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if json.dumps(str(account_name), ensure_ascii=False) in text:
+        raise RuntimeError("checkpoint refused")
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.write("\n")
+    os.replace(temporary, path)
+    return path
+
+
+def load_checkpoint_record(account_name, directory=None):
+    path = os.path.join(directory or PROFILES_DIR, CHECKPOINT_FILENAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(accounts, dict):
+        return None
+    record = accounts.get(account_checkpoint_key(account_name))
+    return record if isinstance(record, dict) else None
+
+
+def remember_checkpoint(account_name, **kwargs):
+    try:
+        record_checkpoint(account_name, **kwargs)
+    except Exception:
+        log.error("检查点未写入")
+
+
+def pid_is_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pid_from_lock_target(target: str):
+    tail = str(target or "").rsplit("-", 1)[-1]
+    if tail.isdigit():
+        return int(tail)
+    return None
+
+
+def inspect_profile_lock(profile_dir, pid_alive=None):
+    """识别 profile 锁归属。不删除任何锁文件。"""
+    alive = pid_alive or pid_is_alive
+    paths = [
+        os.path.join(profile_dir, name)
+        for name in PROFILE_LOCK_NAMES
+        if os.path.lexists(os.path.join(profile_dir, name))
+    ]
+    if not paths:
+        return {"state": "absent", "locks": 0}
+    parsed = False
+    live = False
+    for path in paths:
+        target = ""
+        if os.path.islink(path):
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = ""
+        pid = _pid_from_lock_target(target)
+        if pid is None:
+            continue
+        parsed = True
+        if alive(pid):
+            live = True
+    if live:
+        state = "live"
+    elif parsed:
+        state = "stale"
+    else:
+        state = "unknown"
+    return {"state": state, "locks": len(paths)}
+
+
+def profile_launch_allowed(lock_info) -> bool:
+    return isinstance(lock_info, dict) and lock_info.get("state") == "absent"
+
+
+def should_send_notification(selective: bool) -> bool:
+    return not selective
+
+
+def emit_run_notification(selective, local, title, content, is_success) -> bool:
+    if local or not should_send_notification(selective):
+        log.info("本次不发送通知")
+        return False
+    return bool(push_send(title, content, is_success=is_success))
+
+
+def filter_accounts_for_invocation(accounts, account_name=""):
+    if not account_name:
+        return list(accounts), None
+    selected = [account for account in accounts if account.get("name") == account_name]
+    if not selected:
+        return [], "missing"
+    if len(selected) != 1:
+        return [], "duplicate"
+    return selected, None
+
+
+async def perform_searches(page, search_words, context, search_limit=None):
     """执行搜索 — 顺便贡献 Edge 浏览时长（点击链接模拟真实浏览）。"""
     CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    log.info("开始 %d 次搜索", MAX_SEARCHES)
-    for i in range(MAX_SEARCHES):
+    if search_limit is None:
+        limit = MAX_SEARCHES
+    else:
+        limit = int(search_limit)
+    if limit < 0:
+        limit = 0
+    if limit > MAX_SEARCHES:
+        limit = MAX_SEARCHES
+    log.info("开始 %d 次搜索", limit)
+    for i in range(limit):
         word = search_words[i % len(search_words)]
         form_str = "".join(random.choices(CHARS, k=4))
         cvid_str = "".join(random.choices(CHARS, k=32))
@@ -174,15 +530,17 @@ async def perform_searches(page, search_words, context):
             f"https://cn.bing.com/search?q={url_encode(word)}"
             f"&form={form_str}&cvid={cvid_str}"
         )
-        for recovery_attempt in range(2):
+        for recovery_attempt in range(MAX_PAGE_REOPEN + 1):
             try:
                 # 先滚动到底部（模仿原脚本 smoothScrollToBottom 行为）
                 await page.goto(BING_URL, wait_until="domcontentloaded", timeout=15000)
+                await stop_if_restricted(page)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(random.uniform(0.5, 1.5))
 
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
-                log.info("[%d/%d] %s", i + 1, MAX_SEARCHES, word[:30])
+                await stop_if_restricted(page)
+                log.info("[%d/%d] %s", i + 1, limit, word[:30])
 
                 # ── Edge 浏览：模拟真人浏览 ──
                 await page.evaluate("window.scrollBy(0, 400)")
@@ -205,18 +563,24 @@ async def perform_searches(page, search_words, context):
                                     await link.click()
                                     await asyncio.sleep(random.uniform(3, 6))
                                     break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if isinstance(exc, (AccountRestrictedError, BrowserClosedError)) or is_target_closed_error(exc):
+                            raise
             except PlaywrightTimeout:
-                log.warning("[%d/%d] 搜索超时，跳过", i + 1, MAX_SEARCHES)
+                log.warning("[%d/%d] 搜索超时，跳过", i + 1, limit)
                 break
             except PlaywrightError as exc:
-                if "target page, context or browser has been closed" not in str(exc).casefold():
+                if not is_target_closed_error(exc):
                     raise
-                if recovery_attempt:
+                if recovery_attempt or not context_is_usable(context):
+                    raise BrowserClosedError(completed=i)
+                log.warning("[%d/%d] 页面已关闭，有限重开一次后重试当前搜索", i + 1, limit)
+                try:
+                    page = await context.new_page()
+                except PlaywrightError as reopen_exc:
+                    if is_target_closed_error(reopen_exc) or not context_is_usable(context):
+                        raise BrowserClosedError(completed=i)
                     raise
-                log.warning("[%d/%d] 浏览器页面已关闭，重开页面后重试当前搜索", i + 1, MAX_SEARCHES)
-                page = await context.new_page()
             else:
                 break
 
@@ -249,14 +613,28 @@ async def perform_searches(page, search_words, context):
         pass
 
 
-async def click_daily_activities(page):
+async def click_daily_activities(page, max_clicks=3):
     """点击 Rewards 每日活动中的点击搜索项（每个 10 分），返回成功数。"""
+    try:
+        max_clicks = int(max_clicks)
+    except (TypeError, ValueError):
+        max_clicks = 0
+    max_clicks = max(0, min(3, max_clicks))
+    if max_clicks == 0:
+        log.info("每日活动额度已满，跳过")
+        return 0
     log.info("进入 Rewards 页面，查找每日活动...")
     try:
         await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
     except PlaywrightTimeout:
         log.warning("Rewards 页面加载超时")
+        await stop_if_restricted(page)
         return 0
+    except PlaywrightError as exc:
+        if is_target_closed_error(exc):
+            raise BrowserClosedError(completed=0)
+        raise
+    await stop_if_restricted(page)
     await asyncio.sleep(5)
 
     # 直接用 JS 找所有可见的 bing 搜索链接并点击
@@ -276,7 +654,7 @@ async def click_daily_activities(page):
             }
 
             let done = 0;
-            for (const el of links.slice(0, 3)) {
+            for (const el of links.slice(0, %%MAX_CLICKS%%)) {
                 try {
                     el.click();
                     await new Promise(r => setTimeout(r, 3000));
@@ -287,9 +665,9 @@ async def click_daily_activities(page):
             }
             return done;
         }
-    """)
+    """.replace("%%MAX_CLICKS%%", str(max_clicks)))
 
-    log.info("每日活动完成: 成功 %d/3", clicked)
+    log.info("每日活动完成: 成功 %d/%d", clicked, max_clicks)
     return clicked
 
 
@@ -384,6 +762,9 @@ async def _read_snapshot_from_page(page, rewards_url):
 
 async def get_browser_rewards_snapshot(context):
     """在独立页面读取 Rewards 进度，避免干扰搜索页并重试导航/点击故障。"""
+    if not context_is_usable(context):
+        log.warning("浏览器上下文已关闭，停止积分读取")
+        return None
     urls = (
         "https://rewards.bing.com/earn",
         "https://rewards.bing.com/dashboard",
@@ -396,6 +777,9 @@ async def get_browser_rewards_snapshot(context):
             page = await context.new_page()
             return await _read_snapshot_from_page(page, url)
         except Exception as exc:
+            if is_target_closed_error(exc) or not context_is_usable(context):
+                log.warning("浏览器上下文已关闭，停止积分读取")
+                return None
             log.warning(
                 "Rewards 核验第 %d/%d 次读取失败 (%s): %s",
                 attempt + 1, attempts, type(exc).__name__, exc,
@@ -524,12 +908,23 @@ async def perform_reading_task(page, account_name, captured_token):
 async def run_one_account(account: dict, index: int, total: int, local: bool = False):
     """对单个账号执行完整的 Rewards 流程。
 
-    返回值: "success" | "expired" | "error"
+    返回值: "success" | "expired" | "error" | "restricted"
     """
     name = account.get("name", f"账号{index + 1}")
     session = account.get("session")
     raw_cookies = account.get("cookies", "")
     appkey = account.get("appkey", "")
+
+    def save_progress(reason, complete, snapshot, searches_started):
+        remember_checkpoint(
+            name,
+            now=datetime.now().astimezone(),
+            directory=PROFILES_DIR,
+            reason=reason,
+            complete=complete,
+            snapshot=snapshot,
+            searches_started=searches_started,
+        )
 
     log.info("=" * 50)
     log.info("账号 [%d/%d]: %s", index + 1, total, name)
@@ -538,6 +933,15 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
     if not raw_cookies and not session:
         log.error("账号 %s 既没有 cookies 也没有 session", name)
         return "error"
+
+    if not local:
+        lock_info = inspect_profile_lock(os.path.join(PROFILES_DIR, name))
+        if not profile_launch_allowed(lock_info):
+            log.error(
+                "持久化 profile 锁状态为 %s，拒绝启动，不删除锁，不并发打开",
+                lock_info.get("state"),
+            )
+            return "error"
 
     use_session = bool(session)
     log.info("使用 %s 模式", "session（完整会话）" if use_session else "cookies（DevTools）")
@@ -624,6 +1028,13 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 chromium_path = os.getenv("CHROMIUM_PATH", "")
                 if chromium_path:
                     persistent_kw["executable_path"] = chromium_path
+                lock_info = inspect_profile_lock(profile_dir)
+                if not profile_launch_allowed(lock_info):
+                    log.error(
+                        "持久化 profile 锁状态为 %s，拒绝启动，不删除锁，不并发打开",
+                        lock_info.get("state"),
+                    )
+                    return "error"
                 context = await p.chromium.launch_persistent_context(**persistent_kw)
                 context.on("request", capture_rewards_token)
                 await context.add_init_script(ANTI_DETECTION_SCRIPT)
@@ -642,19 +1053,47 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                     await asyncio.sleep(3)
                 browser_or_ctx = context
 
-            await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(2)
+            try:
+                await page.goto(BING_URL, wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(2)
+                await stop_if_restricted(page)
+            except PlaywrightError as exc:
+                if is_target_closed_error(exc):
+                    log.error("浏览器上下文已关闭，停止且不记为会话过期或任务完成")
+                    save_progress("context_closed", False, None, 0)
+                    return "error"
+                raise
+            except AccountRestrictedError:
+                log.error("检测到验证码或账号限制，立即停止（不绕过、不更换身份或代理），不判定完成")
+                save_progress("restricted", False, None, 0)
+                return "restricted"
 
-            if not await check_logged_in(page):
+            logged_in = await check_logged_in(page)
+            if page_is_closed(page) or not context_is_usable(context):
+                log.error("浏览器上下文已关闭，停止且不记为会话过期或任务完成")
+                save_progress("context_closed", False, None, 0)
+                return "error"
+            if not logged_in:
                 log.warning("❌ 账号 %s 会话已过期，跳过任务", name)
                 return "expired"
 
             log.info("✅ 登录态有效")
 
             initial_snapshot = await get_browser_rewards_snapshot(context)
-            if initial_snapshot and rewards_quotas_complete(initial_snapshot):
+            now = datetime.now().astimezone()
+            checkpoint_record = load_checkpoint_record(name)
+            plan = plan_remaining_work(initial_snapshot, checkpoint_record, now)
+            if plan["action"] == "skip":
+                save_progress("verified_complete", True, initial_snapshot, 0)
                 log.info("账号 %s 今日搜索和活动额度已完成，跳过重复任务", name)
                 return "success"
+            if plan["action"] == "stop":
+                log.error(
+                    "无法确认当前已入账进度（检查点=%s），停止且不按历史次数重放",
+                    plan["checkpoint_relation"],
+                )
+                save_progress(plan["reason"], False, initial_snapshot, 0)
+                return "error"
 
             # 时区 + 今日积分检查，积分满则等跨天后再执行
             local_now = datetime.now()
@@ -696,10 +1135,31 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
             else:
                 log.error("开跑前积分基线读取失败，本账号最终不能判定为成功")
 
-            # 先点每日活动（3 个点击搜索项，各 10 分），再做 30 轮常规搜索
-            # 活动失败不影响搜索，各自独立
+            now = datetime.now().astimezone()
+            plan = plan_remaining_work(score_before, checkpoint_record, now)
+            if plan["action"] == "skip":
+                save_progress("verified_complete", True, score_before, 0)
+                log.info("账号 %s 今日搜索和活动额度已完成，跳过重复任务", name)
+                return "success"
+            if plan["action"] != "run":
+                log.error("开跑前无法确认当前已入账进度，停止且不重放搜索")
+                save_progress(plan["reason"], False, score_before, 0)
+                return "error"
+
+            # 先点剩余每日活动，再按当前已入账缺口搜索。活动失败不影响搜索。
             try:
-                await click_daily_activities(page)
+                if plan["activities"] == 0:
+                    log.info("当前活动额度已满，跳过每日活动点击")
+                else:
+                    await click_daily_activities(page, max_clicks=plan["activities"])
+            except BrowserClosedError:
+                log.error("浏览器或上下文已关闭，停止本账号，不重开 profile，不判定完成")
+                save_progress("context_closed", False, score_before, 0)
+                return "error"
+            except AccountRestrictedError:
+                log.error("检测到验证码或账号限制，立即停止（不绕过、不更换身份或代理），不判定完成")
+                save_progress("restricted", False, score_before, 0)
+                return "restricted"
             except Exception as e:
                 log.warning("每日活动执行失败（不影响搜索）: %s", e)
 
@@ -718,7 +1178,24 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
             else:
                 log.warning("每日活动阶段积分暂不可读，桌面搜索结束后再核验")
 
-            page = await perform_searches(page, search_words, context)
+            try:
+                if plan["searches"] == 0:
+                    log.info("当前搜索额度已满，跳过搜索")
+                else:
+                    page = await perform_searches(
+                        page, search_words, context, search_limit=plan["searches"],
+                    )
+            except BrowserClosedError as exc:
+                log.error(
+                    "浏览器或上下文已关闭，停止本账号，不重开 profile，不判定完成（已结束的搜索尝试=%d）",
+                    exc.completed,
+                )
+                save_progress("context_closed", False, score_before, exc.completed)
+                return "error"
+            except AccountRestrictedError:
+                log.error("检测到验证码或账号限制，立即停止（不绕过、不更换身份或代理），不判定完成")
+                save_progress("restricted", False, score_before, 0)
+                return "restricted"
 
             rewards_verified = False
             activities_complete = False
@@ -770,6 +1247,13 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
             else:
                 log.error("最终积分核验失败：Rewards 页面数据不可读")
 
+            save_progress(
+                "verified_complete" if rewards_verified else "verified_incomplete",
+                bool(rewards_verified),
+                score_after_tasks,
+                plan["searches"],
+            )
+
             # ── 阅读任务 (API 直调) ──
             try:
                 await perform_reading_task(page, name, captured_token)
@@ -791,7 +1275,10 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 return "error"
         finally:
             if browser_or_ctx:
-                await browser_or_ctx.close()
+                try:
+                    await browser_or_ctx.close()
+                except Exception:
+                    log.debug("浏览器关闭时已不可用")
 
 
     log.info("账号 %s 完成", name)
@@ -816,28 +1303,49 @@ async def main(local: bool = False, local_file: str = "", account_name: str = ""
     else:
         accounts = load_accounts()
         if not accounts:
-            push_send("Bing Rewards 配置错误", "BING_ACCOUNTS 为空或解析失败", is_success=False)
+            emit_run_notification(
+                bool(account_name),
+                False,
+                "Bing Rewards 配置错误",
+                "BING_ACCOUNTS 为空或解析失败",
+                False,
+            )
             return 1
 
+    accounts, selection_problem = filter_accounts_for_invocation(accounts, account_name)
+    if selection_problem:
+        log.error("指定账号不可用，未执行任何账号")
+        return 1
     if account_name:
-        accounts = [a for a in accounts if a.get("name") == account_name]
-        if not accounts:
-            log.error("未找到账号: %s", account_name)
-            return 1
-        log.info("只执行指定账号: %s", account_name)
+        log.info("只执行指定账号，共 %d 个", len(accounts))
 
     total = len(accounts)
-    results = {"success": [], "expired": [], "error": []}
+    results = {"success": [], "expired": [], "error": [], "restricted": []}
+    stop_run = False
 
     for i, account in enumerate(accounts):
         name = account.get("name", f"账号{i + 1}")
         try:
             status = await run_one_account(account, i, total, local=local)
-            results[status].append(name)
+            if status == "restricted":
+                results["restricted"].append(name)
+                log.error("检测到验证码或账号限制，停止后续账号")
+                stop_run = True
+            else:
+                results[status].append(name)
+        except AccountRestrictedError:
+            results["restricted"].append(name)
+            log.error("检测到验证码或账号限制，停止后续账号")
+            stop_run = True
+        except BrowserClosedError:
+            log.error("浏览器或上下文已关闭，停止本账号，不重开 profile，不判定完成")
+            results["error"].append(name)
         except Exception as e:
             log.exception("账号 %s 异常: %s", name, e)
             results["error"].append(name)
 
+        if stop_run:
+            break
         if i < total - 1 and ACCOUNT_COOLDOWN > 0:
             log.info("等待 %d 秒冷却...", ACCOUNT_COOLDOWN)
             await asyncio.sleep(ACCOUNT_COOLDOWN)
@@ -845,11 +1353,15 @@ async def main(local: bool = False, local_file: str = "", account_name: str = ""
     success_n = len(results["success"])
     expired_n = len(results["expired"])
     error_n = len(results["error"])
+    restricted_n = len(results["restricted"])
 
     log.info("=" * 50)
-    log.info("完成: 成功 %d, 过期 %d, 失败 %d, 总计 %d", success_n, expired_n, error_n, total)
+    log.info(
+        "完成: 成功 %d, 过期 %d, 失败 %d, 限制 %d, 总计 %d",
+        success_n, expired_n, error_n, restricted_n, total,
+    )
 
-    # ── 推送通知（本地测试跳过） ──
+    # ── 推送通知（本地测试和选择性补跑都跳过） ──
     now_str = datetime.now().strftime("%m-%d %H:%M")
     if not local:
         lines = [f"Bing Rewards 执行完毕 ({now_str})", ""]
@@ -862,11 +1374,14 @@ async def main(local: bool = False, local_file: str = "", account_name: str = ""
             lines.append("或运行 login_helper.py 重新生成 session。更新后手动重跑 Action。")
         if results["error"]:
             lines.append(f"❌ 执行失败 ({error_n}): {', '.join(results['error'])}")
+        if results["restricted"]:
+            lines.append(f"⛔ 账号限制 ({restricted_n}): {', '.join(results['restricted'])}")
 
         content = "\n".join(lines)
-        title = f"Bing Rewards {'✅' if expired_n == 0 and error_n == 0 else '⚠️'} {success_n}/{total} ({now_str})"
-        push_send(title, content, is_success=(expired_n == 0 and error_n == 0))
-    return 0 if (expired_n == 0 and error_n == 0) else 1
+        failed = bool(expired_n or error_n or restricted_n)
+        title = f"Bing Rewards {'✅' if not failed else '⚠️'} {success_n}/{total} ({now_str})"
+        emit_run_notification(bool(account_name), local, title, content, not failed)
+    return 0 if not (expired_n or error_n or restricted_n) else 1
 
 
 if __name__ == "__main__":
@@ -876,7 +1391,7 @@ if __name__ == "__main__":
     parser.add_argument("--account", default="", help="只执行指定账号名，例如 主号")
     args = parser.parse_args()
 
-    log.info("Bing Rewards 多账号自动化启动 (local=%s, account=%s)", args.local, args.account or "全部")
+    log.info("Bing Rewards 多账号自动化启动 (local=%s, selective=%s)", args.local, bool(args.account))
     try:
         sys.exit(asyncio.run(main(local=args.local, local_file=args.file, account_name=args.account)))
     except Exception as e:

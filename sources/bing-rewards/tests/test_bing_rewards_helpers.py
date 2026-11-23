@@ -1,5 +1,9 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import hashlib
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 from playwright.async_api import Error as PlaywrightError
@@ -7,10 +11,26 @@ from playwright.async_api import Error as PlaywrightError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bing_rewards import (
+    MAX_SEARCHES,
+    AccountRestrictedError,
+    BrowserClosedError,
+    CHECKPOINT_FILENAME,
+    click_daily_activities,
+    emit_run_notification,
+    filter_accounts_for_invocation,
     get_browser_rewards_snapshot,
+    inspect_profile_lock,
+    load_checkpoint_record,
     perform_searches,
+    plan_remaining_work,
+    profile_launch_allowed,
+    record_checkpoint,
+    remaining_search_attempts,
     rewards_bearer_from_request,
+    rewards_day_keys,
     rewards_quotas_complete,
+    run_one_account,
+    checkpoint_period_relation,
 )
 
 
@@ -193,6 +213,445 @@ class SearchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(context.pages), 1)
         self.assertEqual(context.pages[0].goto_count, 2)
         self.assertIs(page, context.pages[0])
+
+
+class ClosedOnGotoPage(FakeSearchPage):
+    def __init__(self):
+        super().__init__()
+        self.url = "https://cn.bing.com/"
+
+    async def goto(self, *args, **kwargs):
+        self.goto_count += 1
+        self.closed = True
+        raise PlaywrightError("Target page, context or browser has been closed")
+
+    async def title(self):
+        return "Bing"
+
+
+class ReopeningContext:
+    def __init__(self, fail_new_page=False, closed=False):
+        self.fail_new_page = fail_new_page
+        self.closed = closed
+        self.calls = 0
+        self.pages = []
+
+    def is_closed(self):
+        return self.closed
+
+    async def new_page(self):
+        self.calls += 1
+        if self.fail_new_page:
+            raise PlaywrightError("Target page, context or browser has been closed")
+        page = ClosedOnGotoPage()
+        self.pages.append(page)
+        return page
+
+
+class QuietPage:
+    def __init__(self, url="https://cn.bing.com/", title="Bing"):
+        self.url = url
+        self.title_text = title
+        self.goto_count = 0
+        self.script = ""
+
+    async def goto(self, *args, **kwargs):
+        self.goto_count += 1
+
+    async def title(self):
+        return self.title_text
+
+    async def evaluate(self, script):
+        self.script = script
+        return 0
+
+    def locator(self, selector):
+        return FakeSearchLinks()
+
+
+class ContextClosureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closed_context_does_not_reopen_or_continue(self):
+        page = ClosedOnGotoPage()
+        context = ReopeningContext(closed=True)
+
+        with (
+            patch("bing_rewards.MAX_SEARCHES", 5),
+            patch("bing_rewards.asyncio.sleep", new=AsyncMock()),
+            patch("bing_rewards.random.uniform", return_value=0.1),
+        ):
+            with self.assertRaises(BrowserClosedError) as caught:
+                await perform_searches(page, ["query"], context, search_limit=5)
+
+        self.assertEqual(caught.exception.completed, 0)
+        self.assertEqual(context.calls, 0)
+        self.assertEqual(page.goto_count, 1)
+
+    async def test_new_page_failure_is_bounded_to_one_attempt(self):
+        page = ClosedOnGotoPage()
+        context = ReopeningContext(fail_new_page=True)
+
+        with (
+            patch("bing_rewards.MAX_SEARCHES", 5),
+            patch("bing_rewards.asyncio.sleep", new=AsyncMock()),
+            patch("bing_rewards.random.uniform", return_value=0.1),
+        ):
+            with self.assertRaises(BrowserClosedError):
+                await perform_searches(page, ["query"], context)
+
+        self.assertEqual(context.calls, 1)
+        self.assertEqual(page.goto_count, 1)
+
+    async def test_reopened_page_closure_does_not_start_another_search(self):
+        page = ClosedOnGotoPage()
+        context = ReopeningContext()
+
+        with (
+            patch("bing_rewards.MAX_SEARCHES", 5),
+            patch("bing_rewards.asyncio.sleep", new=AsyncMock()),
+            patch("bing_rewards.random.uniform", return_value=0.1),
+        ):
+            with self.assertRaises(BrowserClosedError):
+                await perform_searches(page, ["query"], context, search_limit=5)
+
+        self.assertEqual(context.calls, 1)
+        self.assertEqual(page.goto_count, 1)
+        self.assertEqual(context.pages[0].goto_count, 1)
+
+    async def test_search_limit_cannot_exceed_configured_maximum(self):
+        page = QuietPage()
+        context = FakeSearchContext()
+
+        with (
+            patch("bing_rewards.MAX_SEARCHES", 2),
+            patch("bing_rewards.asyncio.sleep", new=AsyncMock()),
+            patch("bing_rewards.random.uniform", return_value=0.1),
+        ):
+            await perform_searches(page, ["query"], context, search_limit=100)
+
+        self.assertEqual(page.goto_count, 4)
+
+    async def test_captcha_or_restriction_stops_immediately(self):
+        page = QuietPage(url="https://www.bing.com/captcha/challenge", title="Verify")
+        context = ReopeningContext()
+
+        with (
+            patch("bing_rewards.MAX_SEARCHES", 3),
+            patch("bing_rewards.asyncio.sleep", new=AsyncMock()),
+        ):
+            with self.assertRaises(AccountRestrictedError):
+                await perform_searches(page, ["query"], context, search_limit=3)
+
+        self.assertEqual(page.goto_count, 1)
+        self.assertEqual(context.calls, 0)
+        self.assertEqual(page.script, "")
+
+    async def test_suspended_title_stops_without_url_captcha(self):
+        page = QuietPage(url="https://cn.bing.com/", title="Account suspended")
+
+        with patch("bing_rewards.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(AccountRestrictedError):
+                await perform_searches(page, ["query"], FakeSearchContext(), search_limit=2)
+
+        self.assertEqual(page.goto_count, 1)
+
+    async def test_closed_context_snapshot_is_not_retried(self):
+        context = ReopeningContext(closed=True)
+        with patch("bing_rewards.asyncio.sleep", new=AsyncMock()):
+            self.assertIsNone(await get_browser_rewards_snapshot(context))
+        self.assertEqual(context.calls, 0)
+
+    async def test_closed_new_page_snapshot_stops_after_one_attempt(self):
+        context = ReopeningContext(fail_new_page=True)
+        with patch("bing_rewards.asyncio.sleep", new=AsyncMock()):
+            self.assertIsNone(await get_browser_rewards_snapshot(context))
+        self.assertEqual(context.calls, 1)
+
+
+class ActivityLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activity_clicks_follow_remaining_count_and_stop_on_captcha(self):
+        page = QuietPage(url="https://rewards.bing.com/dashboard", title="Rewards")
+        with patch("bing_rewards.asyncio.sleep", new=AsyncMock()):
+            clicked = await click_daily_activities(page, max_clicks=2)
+        self.assertEqual(clicked, 0)
+        self.assertIn("links.slice(0, 2)", page.script)
+        self.assertNotIn("links.slice(0, 3)", page.script)
+
+        blocked = QuietPage(url="https://account.live.com/abuse", title="restricted")
+        with patch("bing_rewards.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(AccountRestrictedError):
+                await click_daily_activities(blocked, max_clicks=3)
+        self.assertEqual(blocked.script, "")
+
+
+NOW = datetime(2026, 11, 23, 3, 34, tzinfo=timezone(timedelta(hours=8)))
+DONE = {"search_earned": 60, "search_max": 60, "activities_done": 3, "today_total": 90}
+PARTIAL = {"search_earned": 40, "search_max": 60, "activities_done": 1, "today_total": 40}
+
+
+class CreditAndCheckpointTests(unittest.TestCase):
+    def test_configured_search_ceiling_is_unchanged(self):
+        self.assertEqual(MAX_SEARCHES, 30)
+        self.assertEqual(
+            remaining_search_attempts({
+                "search_earned": 0, "search_max": 500, "activities_done": 0,
+            }),
+            30,
+        )
+        self.assertEqual(
+            remaining_search_attempts({
+                "search_earned": 59, "search_max": 90, "activities_done": 0,
+            }),
+            1,
+        )
+
+    def test_finished_accounts_are_not_replayed_and_attempt_log_is_not_credit(self):
+        accounts = [{"name": "one"}, {"name": "two"}, {"name": "three"}]
+        selected, problem = filter_accounts_for_invocation(accounts, "three")
+        self.assertIsNone(problem)
+        self.assertEqual([item["name"] for item in selected], ["three"])
+        same_day = {"complete": True, "searches_started": 26, "day_keys": rewards_day_keys(NOW)}
+        self.assertEqual(plan_remaining_work(DONE, same_day, NOW)["action"], "skip")
+        partial_plan = plan_remaining_work(PARTIAL, same_day, NOW)
+        self.assertEqual(partial_plan["action"], "run")
+        self.assertEqual(partial_plan["searches"], 20)
+        self.assertEqual(partial_plan["activities"], 2)
+        self.assertNotEqual(partial_plan["searches"], 4)
+        self.assertFalse(partial_plan["complete"])
+
+    def test_missing_or_duplicate_selector_does_not_run_accounts(self):
+        accounts = [{"name": "three"}, {"name": "three"}]
+        selected, problem = filter_accounts_for_invocation(accounts, "missing")
+        self.assertEqual(problem, "missing")
+        self.assertEqual(selected, [])
+        selected, problem = filter_accounts_for_invocation(accounts, "three")
+        self.assertEqual(problem, "duplicate")
+        self.assertEqual(selected, [])
+        untouched, problem = filter_accounts_for_invocation(accounts, "")
+        self.assertIsNone(problem)
+        self.assertEqual(len(untouched), 2)
+
+    def test_reset_and_unknown_checkpoints_are_not_completion(self):
+        reset_record = {
+            "complete": True,
+            "searches_started": 26,
+            "day_keys": {
+                "local_date": "2026-11-22",
+                "shanghai_date": "2026-11-22",
+                "rewards_timezone": "unverified",
+            },
+        }
+        self.assertEqual(checkpoint_period_relation(reset_record, NOW), "reset")
+        reset_plan = plan_remaining_work(None, reset_record, NOW)
+        self.assertEqual(reset_plan["action"], "stop")
+        self.assertFalse(reset_plan["complete"])
+        self.assertIsNone(reset_plan["searches"])
+        live_after_reset = plan_remaining_work(
+            {"search_earned": 50, "search_max": 60, "activities_done": 3, "today_total": 80},
+            reset_record,
+            NOW,
+        )
+        self.assertEqual(live_after_reset["searches"], 10)
+        self.assertFalse(live_after_reset["complete"])
+
+        self.assertEqual(checkpoint_period_relation({"complete": True}, NOW), "unknown")
+        unknown = plan_remaining_work(None, {"complete": True, "searches_started": 26}, NOW)
+        self.assertEqual(unknown["action"], "stop")
+        self.assertFalse(unknown["complete"])
+
+        same_day = {"complete": True, "searches_started": 30, "day_keys": rewards_day_keys(NOW)}
+        self.assertEqual(
+            checkpoint_period_relation(same_day, NOW),
+            "same_calendar_dates_timezone_unverified",
+        )
+        self.assertFalse(plan_remaining_work(None, same_day, NOW)["complete"])
+
+    def test_day_keys_keep_the_rewards_timezone_unverified(self):
+        keys = rewards_day_keys(datetime(2026, 11, 22, 20, 0, tzinfo=timezone.utc))
+        self.assertEqual(keys["rewards_timezone"], "unverified")
+        self.assertEqual(keys["local_date"], "2026-11-22")
+        self.assertEqual(keys["shanghai_date"], "2026-11-23")
+        with self.assertRaises(ValueError):
+            rewards_day_keys(datetime(2026, 11, 23, 3, 34))
+
+    def test_checkpoint_file_has_no_account_name_and_cannot_force_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record_checkpoint(
+                "account-3-secret",
+                now=NOW,
+                directory=tmp,
+                reason="context_closed",
+                complete=True,
+                snapshot=PARTIAL,
+                searches_started=26,
+            )
+            raw = (Path(tmp) / CHECKPOINT_FILENAME).read_text(encoding="utf-8")
+            self.assertNotIn("account-3-secret", raw)
+            self.assertNotIn("cookie", raw.casefold())
+            self.assertNotIn("token", raw.casefold())
+            loaded = load_checkpoint_record("account-3-secret", tmp)
+            self.assertFalse(loaded["complete"])
+            self.assertEqual(loaded["searches_started"], 26)
+            self.assertFalse(plan_remaining_work(None, loaded, NOW)["complete"])
+
+            record_checkpoint(
+                "account-3-secret",
+                now=NOW,
+                directory=tmp,
+                reason="verified_complete",
+                complete=True,
+                snapshot=DONE,
+                searches_started=0,
+            )
+            verified = load_checkpoint_record("account-3-secret", tmp)
+            self.assertTrue(verified["complete"])
+            self.assertFalse(plan_remaining_work(None, verified, NOW)["complete"])
+            self.assertEqual(plan_remaining_work(DONE, verified, NOW)["action"], "skip")
+
+
+class ProfileLockTests(unittest.TestCase):
+    def test_live_stale_and_unknown_locks_are_not_removed_or_launched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "SingletonLock"
+            lock.symlink_to("host-4321")
+            with (
+                patch("bing_rewards.os.remove", side_effect=AssertionError("remove")),
+                patch("bing_rewards.os.unlink", side_effect=AssertionError("unlink")),
+            ):
+                live = inspect_profile_lock(tmp, pid_alive=lambda pid: True)
+                stale = inspect_profile_lock(tmp, pid_alive=lambda pid: False)
+            self.assertEqual(live["state"], "live")
+            self.assertEqual(stale["state"], "stale")
+            self.assertFalse(profile_launch_allowed(live))
+            self.assertFalse(profile_launch_allowed(stale))
+            self.assertEqual(os.readlink(lock), "host-4321")
+
+            lock.unlink()
+            lock.write_text("not-a-lock", encoding="utf-8")
+            unknown = inspect_profile_lock(tmp, pid_alive=lambda pid: False)
+            self.assertEqual(unknown["state"], "unknown")
+            self.assertFalse(profile_launch_allowed(unknown))
+            self.assertTrue(lock.is_file())
+
+    def test_absent_lock_is_the_only_launchable_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = inspect_profile_lock(tmp, pid_alive=lambda pid: True)
+        self.assertEqual(info["state"], "absent")
+        self.assertTrue(profile_launch_allowed(info))
+
+
+class _Chromium:
+    def __init__(self):
+        self.launch_calls = 0
+
+    async def launch_persistent_context(self, **kwargs):
+        self.launch_calls += 1
+        raise RuntimeError("launched")
+
+
+class _Playwright:
+    def __init__(self):
+        self.chromium = _Chromium()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class ProfileOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, tmp, alive):
+        playwright = _Playwright()
+        with (
+            patch("bing_rewards.PROFILES_DIR", tmp),
+            patch("bing_rewards.pid_is_alive", side_effect=alive),
+            patch("bing_rewards.async_playwright", return_value=playwright),
+            patch("bing_rewards.fetch_hot_words", new=AsyncMock(side_effect=AssertionError("network"))),
+        ):
+            status = await run_one_account({"name": "acct", "cookies": "A=1"}, 0, 1, local=False)
+        return status, playwright
+
+    async def test_live_lock_does_not_launch_or_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "acct"
+            profile.mkdir()
+            lock = profile / "SingletonLock"
+            lock.symlink_to("host-4321")
+            status, playwright = await self._run(tmp, lambda pid: True)
+            self.assertEqual(status, "error")
+            self.assertEqual(playwright.chromium.launch_calls, 0)
+            self.assertTrue(lock.is_symlink())
+
+    async def test_stale_lock_does_not_launch_or_get_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "acct"
+            profile.mkdir()
+            lock = profile / "SingletonLock"
+            lock.symlink_to("host-4321")
+            status, playwright = await self._run(tmp, lambda pid: False)
+            self.assertEqual(status, "error")
+            self.assertEqual(playwright.chromium.launch_calls, 0)
+            self.assertEqual(os.readlink(lock), "host-4321")
+
+    async def test_absent_lock_still_reaches_the_existing_launch_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            playwright = _Playwright()
+            with (
+                patch("bing_rewards.PROFILES_DIR", tmp),
+                patch("bing_rewards.async_playwright", return_value=playwright),
+                patch("bing_rewards.fetch_hot_words", new=AsyncMock(return_value=["word"])),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await run_one_account({"name": "acct", "cookies": "A=1"}, 0, 1, local=False)
+            self.assertEqual(playwright.chromium.launch_calls, 1)
+
+
+class NotificationTests(unittest.TestCase):
+    def test_selective_invocation_does_not_notify_even_if_push_method_is_set(self):
+        with patch.dict(os.environ, {"PUSH_METHOD": "pushplus", "PUSHPLUS_TOKEN": "x"}, clear=False):
+            with (
+                patch("bing_rewards.push_send") as send,
+                patch("push.requests.post") as post,
+                patch("push.requests.get") as get,
+            ):
+                self.assertFalse(emit_run_notification(True, False, "title", "body", False))
+                send.assert_not_called()
+                post.assert_not_called()
+                get.assert_not_called()
+
+    def test_empty_push_method_does_not_request(self):
+        import push
+        with patch.dict(os.environ, {"PUSH_METHOD": ""}, clear=False):
+            with patch("push.requests.post") as post, patch("push.requests.get") as get:
+                self.assertFalse(push.send("title", "body", False))
+                post.assert_not_called()
+                get.assert_not_called()
+
+    def test_full_run_still_uses_the_push_entrypoint(self):
+        with patch("bing_rewards.push_send", return_value=False) as send:
+            self.assertFalse(emit_run_notification(False, False, "title", "body", True))
+            send.assert_called_once_with("title", "body", is_success=True)
+
+    def test_local_mode_does_not_notify(self):
+        with patch("bing_rewards.push_send") as send:
+            self.assertFalse(emit_run_notification(False, True, "title", "body", True))
+            send.assert_not_called()
+
+
+class ProductionBaselineTests(unittest.TestCase):
+    def test_repair_does_not_depend_on_unprovided_edge_browsing_or_delete_locks(self):
+        source_path = Path(__file__).resolve().parents[1] / "bing_rewards.py"
+        source = source_path.read_text(encoding="utf-8")
+        self.assertNotIn("edge_browsing", source)
+        self.assertNotIn("os.remove", source)
+        self.assertNotIn("os.unlink", source)
+        self.assertNotIn("shutil.rmtree", source)
+        digest = hashlib.sha256(source_path.with_name("browser_utils.py").read_bytes()).hexdigest()
+        self.assertEqual(digest, "1fb5baa321975e040d7ad7405744c33c8630e12b3f4ec1f5464df17b73059178")
+        digest = hashlib.sha256(source_path.with_name("login_helper.py").read_bytes()).hexdigest()
+        self.assertEqual(digest, "82d5a773c576cf8dd16a394399cf70d522d0768ab1fa4f454bcb014ef686a2e4")
+        digest = hashlib.sha256(source_path.with_name("push.py").read_bytes()).hexdigest()
+        self.assertEqual(digest, "79ca65c8ac5592f27334d6c1d9609387085c6e167477b4110565583954390fe9")
 
 
 if __name__ == "__main__":
