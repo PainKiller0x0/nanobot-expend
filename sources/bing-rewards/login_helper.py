@@ -20,11 +20,16 @@ import subprocess
 import sys
 
 # ── 内联常量（方便单文件分发） ──
-BING_URL = "https://www.bing.com"
+BING_URL = "https://cn.bing.com"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+)
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Mobile Safari/537.36 Edg/131.0.0.0"
 )
 ANTI_DETECTION_SCRIPT = """
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -105,7 +110,7 @@ def _find_edge():
     return False
 
 
-async def main(name: str, channel: str = None):
+async def main(name: str, channel: str = None, mobile: bool = False):
     ensure_playwright()
     from playwright.async_api import async_playwright
 
@@ -123,14 +128,17 @@ async def main(name: str, channel: str = None):
     if channel is None:
         ensure_chromium()
         label = "Chromium (Playwright 自带)"
+
+    device = "📱 移动端" if mobile else "💻 PC 端"
     print(f"\n{'=' * 50}")
-    print(f"  Bing Rewards 登录助手 — {name}")
+    print(f"  Bing Rewards 登录助手 — {name} ({device})")
     print(f"  浏览器: {label}")
     print(f"{'=' * 50}\n")
     print("即将打开浏览器，请手动登录微软账号（支持扫码/密码/验证码）。\n")
 
     profiles_root = os.path.join(os.path.expanduser("~"), ".bing-rewards-profiles")
-    user_data_dir = os.path.join(profiles_root, name)
+    suffix = "-mobile" if mobile else ""
+    user_data_dir = os.path.join(profiles_root, f"{name}{suffix}")
     if os.path.exists(user_data_dir):
         print(f"  已有 profile: {user_data_dir}")
         print("  如需重新登录，请先手动删除该目录。\n")
@@ -141,11 +149,28 @@ async def main(name: str, channel: str = None):
         persistent_kwargs = {
             "user_data_dir": user_data_dir,
             "headless": False,
-            "args": HEADFUL_ARGS,
-            "user_agent": USER_AGENT,
-            "viewport": {"width": 1280, "height": 800},
             "locale": "zh-CN",
         }
+        if mobile:
+            persistent_kwargs.update({
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=480,900",
+                ],
+                "user_agent": MOBILE_USER_AGENT,
+                "viewport": {"width": 375, "height": 812},
+                "is_mobile": True,
+                "has_touch": True,
+            })
+        else:
+            persistent_kwargs.update({
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,800",
+                ],
+                "user_agent": USER_AGENT,
+                "viewport": {"width": 1280, "height": 800},
+            })
         if channel:
             persistent_kwargs["channel"] = channel
 
@@ -217,6 +242,7 @@ if __name__ == "__main__":
     parser.add_argument("--name", default="主号", help="账号名称")
     parser.add_argument("--edge", action="store_true", help="使用系统 Edge（不稳定，不推荐）")
     parser.add_argument("--chrome", action="store_true", help="使用系统 Chrome")
+    parser.add_argument("--mobile", action="store_true", help="移动端模式（Android UA + 触屏）")
     args = parser.parse_args()
 
     channel = None
@@ -225,4 +251,4 @@ if __name__ == "__main__":
     elif args.chrome:
         channel = "chrome"
 
-    asyncio.run(main(args.name, channel))
+    asyncio.run(main(args.name, channel, mobile=args.mobile))
