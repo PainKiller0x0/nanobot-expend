@@ -21,16 +21,19 @@ from bing_rewards import (
     get_browser_rewards_snapshot,
     inspect_profile_lock,
     load_checkpoint_record,
+    perform_reading_task,
     perform_searches,
     plan_remaining_work,
     profile_launch_allowed,
+    proven_search_remaining,
     record_checkpoint,
-    remaining_search_attempts,
+    run_refresh_bounded_searches,
     rewards_bearer_from_request,
     rewards_day_keys,
     rewards_quotas_complete,
     run_one_account,
     checkpoint_period_relation,
+    search_step_status,
 )
 
 
@@ -388,21 +391,55 @@ DONE = {"search_earned": 60, "search_max": 60, "activities_done": 3, "today_tota
 PARTIAL = {"search_earned": 40, "search_max": 60, "activities_done": 1, "today_total": 40}
 
 
+def _proven(progress, progress_max=60, per_action=5, activities=3, today=None):
+    return {
+        "search_earned": progress,
+        "search_max": progress_max,
+        "activities_done": activities,
+        "today_total": progress if today is None else today,
+        "pointProgress": progress,
+        "pointProgressMax": progress_max,
+        "pointsPerSearch": per_action,
+    }
+
+
 class CreditAndCheckpointTests(unittest.TestCase):
-    def test_configured_search_ceiling_is_unchanged(self):
+    def test_point_gap_is_not_a_search_count(self):
         self.assertEqual(MAX_SEARCHES, 30)
-        self.assertEqual(
-            remaining_search_attempts({
-                "search_earned": 0, "search_max": 500, "activities_done": 0,
-            }),
-            30,
-        )
-        self.assertEqual(
-            remaining_search_attempts({
-                "search_earned": 59, "search_max": 90, "activities_done": 0,
-            }),
-            1,
-        )
+        self.assertIsNone(proven_search_remaining({
+            "search_earned": 0, "search_max": 500, "activities_done": 0,
+        }))
+        self.assertIsNone(proven_search_remaining({
+            "search_earned": 59, "search_max": 90, "activities_done": 0,
+        }))
+        self.assertIsNone(proven_search_remaining(PARTIAL))
+        self.assertEqual(proven_search_remaining(DONE), 0)
+        self.assertIsNone(proven_search_remaining({
+            "search_earned": 40,
+            "search_max": 60,
+            "activities_done": 3,
+            "pointProgress": 40,
+            "pointProgressMax": 60,
+            "pointsPerSearch": 7,
+        }))
+        self.assertIsNone(proven_search_remaining({
+            "search_earned": 41,
+            "search_max": 60,
+            "activities_done": 3,
+            "pointProgress": 40,
+            "pointProgressMax": 60,
+            "pointsPerSearch": 5,
+        }))
+        self.assertIsNone(proven_search_remaining({
+            "search_earned": 40,
+            "search_max": 60,
+            "activities_done": 3,
+            "pointProgress": True,
+            "pointProgressMax": 60,
+            "pointsPerSearch": 5.0,
+        }))
+        self.assertEqual(proven_search_remaining(_proven(40)), 4)
+        self.assertLessEqual(proven_search_remaining(_proven(40)), MAX_SEARCHES)
 
     def test_finished_accounts_are_not_replayed_and_attempt_log_is_not_credit(self):
         accounts = [{"name": "one"}, {"name": "two"}, {"name": "three"}]
@@ -412,11 +449,14 @@ class CreditAndCheckpointTests(unittest.TestCase):
         same_day = {"complete": True, "searches_started": 26, "day_keys": rewards_day_keys(NOW)}
         self.assertEqual(plan_remaining_work(DONE, same_day, NOW)["action"], "skip")
         partial_plan = plan_remaining_work(PARTIAL, same_day, NOW)
-        self.assertEqual(partial_plan["action"], "run")
-        self.assertEqual(partial_plan["searches"], 20)
-        self.assertEqual(partial_plan["activities"], 2)
-        self.assertNotEqual(partial_plan["searches"], 4)
+        self.assertEqual(partial_plan["action"], "stop")
+        self.assertIsNone(partial_plan["searches"])
         self.assertFalse(partial_plan["complete"])
+        proven_plan = plan_remaining_work(_proven(40, activities=1), same_day, NOW)
+        self.assertEqual(proven_plan["action"], "run")
+        self.assertEqual(proven_plan["searches"], 4)
+        self.assertEqual(proven_plan["activities"], 2)
+        self.assertNotEqual(proven_plan["searches"], 20)
 
     def test_missing_or_duplicate_selector_does_not_run_accounts(self):
         accounts = [{"name": "three"}, {"name": "three"}]
@@ -450,8 +490,10 @@ class CreditAndCheckpointTests(unittest.TestCase):
             reset_record,
             NOW,
         )
-        self.assertEqual(live_after_reset["searches"], 10)
+        self.assertEqual(live_after_reset["action"], "stop")
+        self.assertIsNone(live_after_reset["searches"])
         self.assertFalse(live_after_reset["complete"])
+        self.assertEqual(live_after_reset["checkpoint_relation"], "reset")
 
         self.assertEqual(checkpoint_period_relation({"complete": True}, NOW), "unknown")
         unknown = plan_remaining_work(None, {"complete": True, "searches_started": 26}, NOW)
@@ -636,6 +678,166 @@ class NotificationTests(unittest.TestCase):
         with patch("bing_rewards.push_send") as send:
             self.assertFalse(emit_run_notification(False, True, "title", "body", True))
             send.assert_not_called()
+
+
+class SearchStepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_partial_unchanged_unknown_and_hard_cap(self):
+        calls = {"n": 0}
+
+        async def no_search():
+            calls["n"] += 1
+
+        async def full():
+            return DONE
+
+        done = await run_refresh_bounded_searches(full, no_search)
+        self.assertEqual(done["action"], "done")
+        self.assertEqual(done["reason"], "remaining_zero")
+        self.assertEqual(calls["n"], 0)
+
+        async def partial():
+            return PARTIAL
+
+        stopped = await run_refresh_bounded_searches(partial, no_search)
+        self.assertEqual(stopped["action"], "stop")
+        self.assertEqual(stopped["reason"], "remaining_unproven")
+        self.assertEqual(calls["n"], 0)
+        self.assertFalse(stopped["complete"])
+
+        sequence = [
+            _proven(50),
+            _proven(50),
+        ]
+
+        async def unchanged():
+            return sequence.pop(0)
+
+        unchanged_result = await run_refresh_bounded_searches(unchanged, no_search)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(unchanged_result["action"], "stop")
+        self.assertEqual(unchanged_result["reason"], "unchanged")
+
+        async def missing():
+            return None
+
+        unknown = await run_refresh_bounded_searches(missing, no_search)
+        self.assertEqual(unknown["reason"], "remaining_unproven")
+        self.assertEqual(calls["n"], 1)
+
+        self.assertEqual(search_step_status(_proven(50), _proven(55)), "advanced")
+        self.assertEqual(search_step_status(_proven(55), _proven(60, progress_max=60)), "complete")
+        self.assertEqual(search_step_status(_proven(50), None), "unknown")
+        self.assertEqual(search_step_status(_proven(40), _proven(50)), "inconsistent")
+
+        capped = [_proven(0, progress_max=20, per_action=5), _proven(5, progress_max=20, per_action=5)]
+
+        async def capped_refresh():
+            if capped:
+                return capped.pop(0)
+            return _proven(5, progress_max=20, per_action=5)
+
+        with patch("bing_rewards.MAX_SEARCHES", 1):
+            hard = await run_refresh_bounded_searches(capped_refresh, no_search)
+        self.assertEqual(hard["action"], "stop")
+        self.assertEqual(hard["reason"], "hard_cap")
+        self.assertEqual(hard["completed"], 1)
+        self.assertFalse(hard["complete"])
+        self.assertEqual(calls["n"], 2)
+
+    async def test_proven_steps_stop_when_remaining_is_zero(self):
+        snaps = [_proven(50), _proven(55), _proven(55), _proven(60)]
+        calls = {"n": 0}
+
+        async def refresh():
+            return snaps.pop(0)
+
+        async def search():
+            calls["n"] += 1
+
+        result = await run_refresh_bounded_searches(refresh, search)
+        self.assertEqual(result["action"], "done")
+        self.assertEqual(result["reason"], "refreshed_complete")
+        self.assertEqual(calls["n"], 2)
+
+    async def test_restriction_stops_the_search_loop(self):
+        calls = {"n": 0}
+
+        async def refresh():
+            return _proven(40, activities=3)
+
+        async def search():
+            calls["n"] += 1
+            raise AccountRestrictedError()
+
+        with self.assertRaises(AccountRestrictedError):
+            await run_refresh_bounded_searches(refresh, search)
+        self.assertEqual(calls["n"], 1)
+
+
+class _ReadingResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
+
+
+class _ReadingClient:
+    def __init__(self):
+        self.posts = []
+        self.gets = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, url, headers=None, timeout=None):
+        self.gets.append(url)
+        return _ReadingResponse({
+            "response": {
+                "promotions": [{
+                    "name": "readarticle3_30points",
+                    "attributes": {
+                        "activityprogress": "0",
+                        "activitymax": "1",
+                        "complete": "False",
+                    },
+                }]
+            }
+        })
+
+    async def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append({"url": url, "body": json})
+        return _ReadingResponse({
+            "code": 0,
+            "isDuplicate": False,
+            "response": {"activity": {"p": 0}, "balance": 1},
+        })
+
+
+class ReadingImportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_reading_path_has_hashlib_and_does_not_hit_network(self):
+        client = _ReadingClient()
+        page = QuietPage(url="https://rewards.bing.com/dashboard", title="Rewards")
+
+        def client_factory(*args, **kwargs):
+            return client
+
+        with (
+            patch("bing_rewards.httpx.AsyncClient", client_factory),
+            patch("bing_rewards.asyncio.sleep", new=AsyncMock()),
+        ):
+            await perform_reading_task(page, "reader", {"value": "Bearer test-token"})
+
+        self.assertEqual(len(client.posts), 1)
+        body = client.posts[0]["body"]
+        self.assertEqual(body["attributes"]["offerid"], "ENUS_readarticle3_30points")
+        self.assertEqual(len(body["id"]), 64)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in body["id"]))
+        self.assertIn("/dapi/me/activities", client.posts[0]["url"])
+        self.assertNotIn("test-token", body["id"])
 
 
 class ProductionBaselineTests(unittest.TestCase):

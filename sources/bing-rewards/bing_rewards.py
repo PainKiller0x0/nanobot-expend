@@ -12,6 +12,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -300,22 +301,100 @@ def _snapshot_ints(snapshot):
     return parsed
 
 
-def remaining_search_attempts(snapshot, max_searches=MAX_SEARCHES):
-    """按当前已入账缺口限制搜索次数，不超过配置上限。
+def _exact_int(value):
+    """只接受整数或纯数字字符串。拒绝 bool、float 和截断。"""
+    if isinstance(value, bool) or isinstance(value, float):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip())
+    return None
 
-    单次搜索对应的分数未验证，所以用距离既有 60 分完成线的缺口作为次数上界。
-    历史尝试次数不是已入账分数。
+
+def _labeled_int(text, label):
+    if not text:
+        return None
+    match = re.search(
+        rf"(?i)(?<![A-Za-z0-9_]){re.escape(label)}(?![A-Za-z0-9_])\s*[:=]\s*([0-9]+)",
+        text,
+    )
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def proven_search_remaining(snapshot, max_searches=MAX_SEARCHES):
+    """返回还能做的搜索次数。无法证明时返回 None，调用方必须停止。
+
+    页面上的「必应搜索 X/Y」是累计分数，不是次数。只有同时存在
+    pointProgress、pointProgressMax 和 pointsPerSearch，且剩余分数能被
+    每次上限整除、并与累计分数一致时，才把商当作次数。已满既有完成线
+    或已满显示上限时返回 0。历史尝试次数和分数缺口都不能换成次数。
+    max_searches 只是配置硬限，不参与换算。
     """
+    del max_searches
+    if not isinstance(snapshot, dict):
+        return None
     parsed = _snapshot_ints(snapshot)
+    progress = _exact_int(snapshot.get("pointProgress"))
+    progress_max = _exact_int(snapshot.get("pointProgressMax"))
+    per_action = _exact_int(snapshot.get("pointsPerSearch"))
+    has_any_progress = any(key in snapshot for key in ("pointProgress", "pointProgressMax", "pointsPerSearch"))
+    if has_any_progress and (progress is None or progress_max is None or per_action is None):
+        return None
+    if progress is not None:
+        if per_action <= 0 or progress < 0 or progress_max < progress:
+            return None
+        if parsed and (parsed["search_earned"] != progress or parsed["search_max"] != progress_max):
+            return None
+        remaining_points = progress_max - progress
+        if remaining_points % per_action != 0:
+            return None
+        return remaining_points // per_action
     if not parsed:
         return None
-    earned = parsed["search_earned"]
-    if earned >= 60 or earned >= parsed["search_max"]:
+    if parsed["search_earned"] >= 60 or parsed["search_earned"] >= parsed["search_max"]:
         return 0
-    gap = min(parsed["search_max"], 60) - earned
-    if gap <= 0:
-        return 0
-    return min(int(max_searches), gap)
+    return None
+
+
+def search_step_status(before, after):
+    """比较一次搜索前后的实读进度。无法证明刚好前进一次就不要继续。"""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return "unknown"
+    after_parsed = _snapshot_ints(after)
+    if after_parsed and rewards_quotas_complete(after_parsed):
+        earned_before = _exact_int(before.get("search_earned"))
+        earned_after = after_parsed["search_earned"]
+        if earned_before is not None and earned_after < earned_before:
+            return "inconsistent"
+        return "complete"
+    before_left = proven_search_remaining(before)
+    after_left = proven_search_remaining(after)
+    if before_left is None or after_left is None:
+        return "unknown"
+    if after_left == before_left:
+        before_progress = _exact_int(before.get("pointProgress"))
+        after_progress = _exact_int(after.get("pointProgress"))
+        if before_progress is not None and before_progress == after_progress:
+            return "unchanged"
+        if before_progress is None and _exact_int(before.get("search_earned")) == _exact_int(after.get("search_earned")):
+            return "unchanged"
+        return "inconsistent"
+    if after_left != before_left - 1:
+        return "inconsistent"
+    per_action = _exact_int(before.get("pointsPerSearch"))
+    if (
+        per_action is None
+        or per_action != _exact_int(after.get("pointsPerSearch"))
+        or _exact_int(before.get("pointProgressMax")) != _exact_int(after.get("pointProgressMax"))
+        or _exact_int(after.get("pointProgress")) != _exact_int(before.get("pointProgress")) + per_action
+    ):
+        return "inconsistent"
+    if after_left == 0:
+        return "complete"
+    return "advanced"
 
 
 def remaining_activities(snapshot):
@@ -337,7 +416,7 @@ def plan_remaining_work(live_snapshot, checkpoint_record, now):
             "searches": 0,
             "activities": 0,
         }
-    searches = remaining_search_attempts(live_snapshot)
+    searches = proven_search_remaining(live_snapshot)
     activities = remaining_activities(live_snapshot)
     if searches is None or activities is None:
         return {
@@ -347,6 +426,15 @@ def plan_remaining_work(live_snapshot, checkpoint_record, now):
             "complete": False,
             "searches": None,
             "activities": None,
+        }
+    if searches == 0 and activities == 0:
+        return {
+            "action": "stop",
+            "reason": "incomplete_without_proven_work",
+            "checkpoint_relation": relation,
+            "complete": False,
+            "searches": 0,
+            "activities": 0,
         }
     return {
         "action": "run",
@@ -358,8 +446,36 @@ def plan_remaining_work(live_snapshot, checkpoint_record, now):
     }
 
 
+async def run_refresh_bounded_searches(refresh, search_once, max_searches=MAX_SEARCHES):
+    """每次搜索前后重新读取剩余次数。无法证明、没变化或不一致就停止。"""
+    try:
+        cap = int(max_searches)
+    except (TypeError, ValueError):
+        cap = 0
+    cap = max(0, min(cap, MAX_SEARCHES))
+    completed = 0
+    while completed < cap:
+        before = await refresh()
+        remaining = proven_search_remaining(before)
+        if remaining == 0:
+            return {"action": "done", "completed": completed, "reason": "remaining_zero", "complete": False}
+        if remaining is None:
+            return {"action": "stop", "completed": completed, "reason": "remaining_unproven", "complete": False}
+        await search_once()
+        completed += 1
+        after = await refresh()
+        status = search_step_status(before, after)
+        if status == "complete":
+            return {"action": "done", "completed": completed, "reason": "refreshed_complete", "complete": False}
+        if status != "advanced":
+            return {"action": "stop", "completed": completed, "reason": status, "complete": False}
+    final = await refresh()
+    if proven_search_remaining(final) == 0:
+        return {"action": "done", "completed": completed, "reason": "hard_cap_complete", "complete": False}
+    return {"action": "stop", "completed": completed, "reason": "hard_cap", "complete": False}
+
+
 def account_checkpoint_key(name: str) -> str:
-    import hashlib
     return hashlib.sha256(str(name).encode("utf-8")).hexdigest()
 
 
@@ -718,6 +834,7 @@ async def _open_points_details(page):
 
 async def _read_snapshot_from_page(page, rewards_url):
     await page.goto(rewards_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+    await stop_if_restricted(page)
     try:
         await page.wait_for_selector("text=积分明细", timeout=15000)
     except PlaywrightTimeout:
@@ -752,12 +869,19 @@ async def _read_snapshot_from_page(page, rewards_url):
     if not total_match or not search_match:
         raise ValueError("缺少今日总分或必应搜索积分")
 
-    return {
+    snapshot = {
         "today_total": int(total_match.group(1).replace(",", "")),
         "search_earned": int(search_match.group(1).replace(",", "")),
         "search_max": int(search_match.group(2).replace(",", "")),
         "activities_done": int(activity_match.group(1)),
     }
+    # 只有响应里明确写出这些字段才收录。没有它们就不能把分数换算成次数。
+    combined_text = f"{details_text}\n{body_text}"
+    for label in ("pointProgress", "pointProgressMax", "pointsPerSearch"):
+        found = _labeled_int(combined_text, label)
+        if found is not None:
+            snapshot[label] = found
+    return snapshot
 
 
 async def get_browser_rewards_snapshot(context):
@@ -776,6 +900,8 @@ async def get_browser_rewards_snapshot(context):
         try:
             page = await context.new_page()
             return await _read_snapshot_from_page(page, url)
+        except AccountRestrictedError:
+            raise
         except Exception as exc:
             if is_target_closed_error(exc) or not context_is_usable(context):
                 log.warning("浏览器上下文已关闭，停止积分读取")
@@ -1146,7 +1272,7 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 save_progress(plan["reason"], False, score_before, 0)
                 return "error"
 
-            # 先点剩余每日活动，再按当前已入账缺口搜索。活动失败不影响搜索。
+            # 活动次数来自「n/3」计数。搜索必须由实读进度证明，不能把分数缺口当次数。
             try:
                 if plan["activities"] == 0:
                     log.info("当前活动额度已满，跳过每日活动点击")
@@ -1178,13 +1304,19 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
             else:
                 log.warning("每日活动阶段积分暂不可读，桌面搜索结束后再核验")
 
+            async def refresh_search_snapshot():
+                await stop_if_restricted(page)
+                return await get_browser_rewards_snapshot(context)
+
+            async def search_once():
+                nonlocal page
+                page = await perform_searches(page, search_words, context, search_limit=1)
+
+            search_result = {"action": "stop", "completed": 0, "reason": "not_started", "complete": False}
             try:
-                if plan["searches"] == 0:
-                    log.info("当前搜索额度已满，跳过搜索")
-                else:
-                    page = await perform_searches(
-                        page, search_words, context, search_limit=plan["searches"],
-                    )
+                search_result = await run_refresh_bounded_searches(
+                    refresh_search_snapshot, search_once,
+                )
             except BrowserClosedError as exc:
                 log.error(
                     "浏览器或上下文已关闭，停止本账号，不重开 profile，不判定完成（已结束的搜索尝试=%d）",
@@ -1194,8 +1326,15 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 return "error"
             except AccountRestrictedError:
                 log.error("检测到验证码或账号限制，立即停止（不绕过、不更换身份或代理），不判定完成")
-                save_progress("restricted", False, score_before, 0)
+                save_progress("restricted", False, score_before, search_result["completed"])
                 return "restricted"
+            if search_result["action"] != "done":
+                log.error(
+                    "搜索进度无法安全确认（%s），停止，不把分数缺口换成次数，不判定完成",
+                    search_result["reason"],
+                )
+                save_progress(search_result["reason"], False, score_before, search_result["completed"])
+                return "error"
 
             rewards_verified = False
             activities_complete = False
@@ -1251,7 +1390,7 @@ async def run_one_account(account: dict, index: int, total: int, local: bool = F
                 "verified_complete" if rewards_verified else "verified_incomplete",
                 bool(rewards_verified),
                 score_after_tasks,
-                plan["searches"],
+                search_result["completed"],
             )
 
             # ── 阅读任务 (API 直调) ──
